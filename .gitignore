@@ -1,0 +1,28 @@
+# Downloaded plugins
+wp_zips/
+wp_extracted/
+
+# Scan reports
+vuln_report.*
+scan_test.*
+cordyceps_report.*
+plugins.csv
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

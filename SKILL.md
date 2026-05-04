@@ -3,7 +3,46 @@ name: cordyceps
 description: "Cordyceps - The parasitic fungus that finds what's taking over your WordPress. Automated plugin vulnerability scanner powered by Mycelium + Patchstack Academy."
 homepage: https://patchstack.com/academy/wordpress/vulnerabilities/
 user-invocable: true
-metadata: { "openclaw": { "emoji": "\ud83e\udddf", "requires": { "anyBins": ["mycelium", "mycelium.exe"] }, "os": ["linux", "win32", "darwin"], "install": [{ "id": "download-linux", "kind": "download", "url": "https://github.com/zhugez/Mycelium/releases/download/v1.0.0/mycelium-linux-amd64", "os": ["linux"], "targetDir": "~/.openclaw/tools/cordyceps" }, { "id": "download-windows", "kind": "download", "url": "https://github.com/zhugez/Mycelium/releases/download/v1.0.0/mycelium-windows-amd64.exe", "os": ["win32"], "targetDir": "~/.openclaw/tools/cordyceps" }] } }
+metadata:
+  openclaw:
+    emoji: "\U0001F9DF"
+    requires:
+      anyBins: [mycelium, mycelium.exe]
+    os: [linux, win32, darwin]
+    install:
+      - id: install-cordyceps
+        kind: script
+        run: ./install.sh --runtime openclaw
+        os: [linux, darwin]
+      - id: install-cordyceps-windows
+        kind: script
+        run: powershell -ExecutionPolicy Bypass -File ./install.ps1 -Runtime openclaw
+        os: [win32]
+  hermes:
+    emoji: "\U0001F9DF"
+    category: security
+    tags: [security, wordpress, vulnerability-scanner, static-analysis, patchstack]
+    requires_toolsets: [terminal]
+    requires:
+      anyBins: [mycelium, mycelium.exe]
+    install:
+      - id: install-cordyceps-hermes
+        kind: script
+        run: ./install.sh --runtime hermes
+        os: [linux, darwin]
+      - id: install-cordyceps-hermes-windows
+        kind: script
+        run: powershell -ExecutionPolicy Bypass -File ./install.ps1 -Runtime hermes
+        os: [win32]
+    config:
+      - key: cordyceps.min_active
+        description: Minimum active installs filter for plugin harvest.
+        default: "10000"
+        prompt: "Minimum active installs (default 10000)"
+      - key: cordyceps.fail_on
+        description: Severity threshold that makes the scanner exit non-zero.
+        default: "never"
+        prompt: "Fail-on severity (critical|high|medium|low|never)"
 ---
 
 # CORDYCEPS - WordPress Vulnerability Hunter
@@ -39,22 +78,39 @@ mycelium --min-active 10000 --pages 3 --list-only --csv-path plugins.csv
 - `-e, --extract` -- Extract all zips after download
 - `--extract-dir <DIR>` -- Extraction directory (default: wp_extracted)
 
-If the Mycelium binary is not on PATH, check these locations:
-- `{baseDir}/mycelium-linux-amd64` or `{baseDir}/mycelium-windows-amd64.exe`
-- `~/.openclaw/skills/cordyceps/mycelium-linux-amd64` (Linux binary bundled)
-- `~/.openclaw/skills/cordyceps/mycelium-windows-amd64.exe` (Windows binary bundled)
+If the Mycelium binary is not on `PATH`, the scanner auto-discovers it from
+both runtimes. The first match wins:
+
+**OpenClaw layout:**
 - `~/.openclaw/tools/cordyceps/mycelium`
+- `~/.openclaw/skills/cordyceps/mycelium`
+- `~/.openclaw/skills/cordyceps/mycelium-linux-amd64`
+- `~/.openclaw/skills/cordyceps/mycelium-windows-amd64.exe`
 
-**Setup for Linux:**
+**Hermes Agent layout:**
+- `~/.hermes/tools/cordyceps/mycelium`
+- `~/.hermes/skills/security/cordyceps/mycelium`
+- `~/.hermes/skills/security/cordyceps/mycelium-linux-amd64`
+- `~/.hermes/skills/security/cordyceps/mycelium-windows-amd64.exe`
+
+**Override:** set `CORDYCEPS_MYCELIUM=/path/to/mycelium` to use an explicit binary.
+
+**Bootstrap (auto-detect runtime, fetch latest Mycelium release):**
 ```bash
-cp ~/.openclaw/skills/cordyceps/mycelium-linux-amd64 /usr/local/bin/mycelium
-chmod +x /usr/local/bin/mycelium
+# POSIX
+bash install.sh                    # auto-detect runtime
+bash install.sh --runtime hermes   # force Hermes layout
+bash install.sh --runtime openclaw # force OpenClaw layout
+```
+```powershell
+# Windows
+.\install.ps1                      # auto-detect runtime
+.\install.ps1 -Runtime hermes
+.\install.ps1 -Runtime openclaw
 ```
 
-**Setup for Windows:**
-```powershell
-copy %USERPROFILE%\.openclaw\skills\cordyceps\mycelium-windows-amd64.exe %USERPROFILE%\mycelium.exe
-```
+The installer pulls the matching binary from
+`https://api.github.com/repos/zhugez/Mycelium/releases/latest` for your OS/arch.
 
 ### Alternative: Use the Python scanner (Cordyceps Engine)
 

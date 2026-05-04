@@ -1,8 +1,9 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.0.0-brightgreen?style=for-the-badge" alt="Version"/>
+  <img src="https://img.shields.io/badge/version-1.1.0-brightgreen?style=for-the-badge" alt="Version"/>
   <img src="https://img.shields.io/badge/platform-linux%20%7C%20windows%20%7C%20macos-blue?style=for-the-badge" alt="Platform"/>
   <img src="https://img.shields.io/badge/license-MIT-orange?style=for-the-badge" alt="License"/>
-  <img src="https://img.shields.io/badge/openclaw-skill-purple?style=for-the-badge" alt="OpenClaw Skill"/>
+  <img src="https://img.shields.io/badge/runtime-OpenClaw%20%7C%20Hermes-purple?style=for-the-badge" alt="Runtimes"/>
+  <img src="https://img.shields.io/badge/spec-agentskills.io-lightgrey?style=for-the-badge" alt="agentskills.io"/>
 </p>
 
 <h1 align="center">
@@ -31,13 +32,15 @@
 
 ## What is Cordyceps?
 
-**Cordyceps** is an [OpenClaw](https://docs.openclaw.ai) skill that automates the process of:
+**Cordyceps** is an [agentskills.io](https://agentskills.io) skill - works with both
+[OpenClaw](https://docs.openclaw.ai) and [Hermes Agent](https://github.com/nousresearch/hermes-agent) -
+that automates:
 
 1. **Harvesting** popular WordPress plugins (10k+ active installs) using the [Mycelium](https://github.com/zhugez/Mycelium) bulk downloader
 2. **Scanning** their PHP source code for 17 categories of security vulnerabilities
 3. **Reporting** findings with severity ratings, CVSS estimates, and remediation advice
 
-Named after the parasitic fungus from *The Last of Us* -- just as Cordyceps finds and takes over its host, this tool finds the vulnerabilities taking over WordPress plugins.
+Named after the parasitic fungus from *The Last of Us* - just as Cordyceps finds and takes over its host, this tool finds the vulnerabilities taking over WordPress plugins.
 
 ---
 
@@ -67,110 +70,99 @@ Cordyceps detects **17 vulnerability categories** based on the [Patchstack Acade
 
 ---
 
-## Architecture
-
-```
-                    +------------------+
-                    |   WordPress.org  |
-                    |    Plugin API    |
-                    +--------+---------+
-                             |
-                    +--------v---------+
-                    |    MYCELIUM      |     Rust-powered bulk downloader
-                    |  (Harvester)     |     Filters by active installs
-                    +--------+---------+
-                             |
-                    +--------v---------+
-                    |   wp_extracted/   |     Extracted plugin source code
-                    |   +-- plugin-a/  |
-                    |   +-- plugin-b/  |
-                    |   +-- plugin-c/  |
-                    +--------+---------+
-                             |
-              +--------------+--------------+
-              |                             |
-     +--------v---------+         +--------v---------+
-     |   scanner.py     |         |    scan.sh       |
-     | (Python Engine)  |         | (Bash/ripgrep)   |
-     | Context-aware    |         | Fast pattern     |
-     | CVSS scoring     |         | matching         |
-     | Auth detection   |         |                  |
-     +--------+---------+         +--------+---------+
-              |                             |
-              +--------------+--------------+
-                             |
-              +--------------v--------------+
-              |     VULNERABILITY REPORT    |
-              |  +-- vuln_report.md         |
-              |  +-- vuln_report.json       |
-              |  +-- vuln_report.csv        |
-              +-----------------------------+
-```
-
----
-
 ## Quick Start
 
 ### Installation
 
-#### As OpenClaw Skill (Recommended)
+The installer auto-detects your runtime (OpenClaw or Hermes), downloads the
+matching Mycelium binary from the latest GitHub release, and wires the skill
+into the right directory.
 
-```bash
-# Clone to OpenClaw skills directory
-git clone https://github.com/zhugez/cordyceps.git ~/.openclaw/skills/cordyceps
-
-# Setup Mycelium binary
-# Linux:
-chmod +x ~/.openclaw/skills/cordyceps/mycelium-linux-amd64
-sudo cp ~/.openclaw/skills/cordyceps/mycelium-linux-amd64 /usr/local/bin/mycelium
-
-# Windows (PowerShell):
-copy $env:USERPROFILE\.openclaw\skills\cordyceps\mycelium-windows-amd64.exe $env:USERPROFILE\mycelium.exe
-```
-
-#### Standalone Usage
+#### POSIX (Linux / macOS)
 
 ```bash
 git clone https://github.com/zhugez/cordyceps.git
 cd cordyceps
-chmod +x mycelium-linux-amd64  # or use mycelium-windows-amd64.exe
+bash install.sh                       # auto-detect runtime
+# bash install.sh --runtime openclaw  # force OpenClaw
+# bash install.sh --runtime hermes    # force Hermes
+# bash install.sh --skip-binary       # don't download Mycelium
 ```
+
+#### Windows (PowerShell)
+
+```powershell
+git clone https://github.com/zhugez/cordyceps.git
+Set-Location cordyceps
+.\install.ps1                         # auto-detect runtime
+# .\install.ps1 -Runtime openclaw
+# .\install.ps1 -Runtime hermes
+# .\install.ps1 -SkipBinary
+```
+
+#### Standalone (no agent)
+
+```bash
+git clone https://github.com/zhugez/cordyceps.git
+cd cordyceps
+pip install -e .
+bash install.sh --skip-binary         # creates ./mycelium symlink scope only
+# or fetch Mycelium manually:
+# curl -L https://github.com/zhugez/Mycelium/releases/latest/download/mycelium-linux-amd64 -o mycelium
+# chmod +x mycelium
+cordyceps scan -d wp_extracted
+```
+
+#### Skill location after install
+
+| Runtime  | Path |
+|----------|------|
+| OpenClaw | `~/.openclaw/skills/cordyceps/` |
+| Hermes   | `~/.hermes/skills/security/cordyceps/` |
+
+Override the home directory with `OPENCLAW_HOME` / `HERMES_HOME` if you use
+non-default locations.
 
 ---
 
 ### Usage
 
-#### Full Pipeline (Harvest + Scan)
+#### Full pipeline (harvest + scan)
 
 ```bash
 # Download plugins with 10k+ active installs, then scan
 python scanner.py all --min-active 10000 --pages 5 -f md json csv
 ```
 
-#### Step by Step
+#### Step by step
 
 ```bash
-# Step 1: Preview targets
-mycelium --min-active 10000 --pages 3 --list-only
+# 1. Preview targets
+python scanner.py download --min-active 10000 --pages 3 --list-only
 
-# Step 2: Harvest & extract plugins
-mycelium --min-active 10000 --pages 10 --extract --workers 10
+# 2. Harvest & extract
+python scanner.py download --min-active 10000 --pages 10 -w 10
 
-# Step 3: Scan with Python engine (detailed analysis)
+# 3. Scan
 python scanner.py scan -d wp_extracted -r cordyceps_report -f md json csv
 
-# Step 3 (alt): Quick scan with Bash script
+# 3 (alt). Quick scan with bash
 bash scan.sh scan
 ```
 
-#### Quick Bash Scan
+#### CI integration
 
 ```bash
-# Full pipeline via bash
-bash scan.sh all
+python scanner.py scan -d wp_extracted --fail-on critical --quiet -f json
+# exits 1 if any CRITICAL finding exists; else 0
+```
 
-# Environment variable overrides
-MIN_ACTIVE=50000 PAGES=20 bash scan.sh all
+`--fail-on` accepts: `critical`, `high`, `medium`, `low`, `never` (default).
+
+#### Bash quick-scan environment overrides
+
+```bash
+MIN_ACTIVE=50000 PAGES=20 NO_COLOR=1 bash scan.sh all
 ```
 
 ---
@@ -179,11 +171,11 @@ MIN_ACTIVE=50000 PAGES=20 bash scan.sh all
 
 | Format | File | Best For |
 |--------|------|----------|
-| **Markdown** | `vuln_report.md` | Human-readable reports, presentations |
-| **JSON** | `vuln_report.json` | Programmatic processing, CI/CD integration |
-| **CSV** | `vuln_report.csv` | Spreadsheet analysis, data science |
+| **Markdown** | `vuln_report.md` | Human-readable reports |
+| **JSON** | `vuln_report.json` | Programmatic processing, CI/CD |
+| **CSV** | `vuln_report.csv` | Spreadsheet analysis |
 
-### Sample Report Output
+### Sample summary
 
 ```
 ============================================================
@@ -196,7 +188,7 @@ SCAN SUMMARY
   Broken Access Control:   10
   Arbitrary File Upload:    9
   Shortcode XSS:            4
-  SSRF:                      1
+  SSRF:                     1
 
   TOTAL: 357 potential vulnerabilities
 ============================================================
@@ -208,13 +200,25 @@ SCAN SUMMARY
 
 ```
 cordyceps/
-|
-|-- SKILL.md                      # OpenClaw skill definition (17 vuln types)
-|-- scanner.py                    # Python scanner engine (context-aware)
-|-- scan.sh                       # Bash scanner (fast ripgrep-based)
-|-- mycelium-linux-amd64          # Mycelium binary (Linux x86_64)
-|-- mycelium-windows-amd64.exe    # Mycelium binary (Windows x86_64)
-+-- README.md                     # This file
++-- SKILL.md                # Skill manifest (dual: openclaw + hermes)
++-- scanner.py              # Python scanner engine (context-aware)
++-- scan.sh                 # Bash quick-scan (rg/grep)
++-- install.sh              # POSIX installer (downloads Mycelium)
++-- install.ps1             # Windows installer
++-- pyproject.toml          # Python packaging + ruff/pytest config
++-- tests/                  # Unit + integration tests with PHP fixtures
++-- .github/workflows/      # CI: ruff + pytest matrix (Linux + Windows)
++-- README.md               # This file
++-- SECURITY.md             # Disclosure policy
++-- CONTRIBUTING.md         # Dev setup, pattern guidelines
++-- CHANGELOG.md            # Version history
+```
+
+Mycelium binaries are no longer bundled in the repo; the installer fetches the
+latest release for your OS/arch. To pin a specific tag:
+
+```bash
+bash install.sh --mycelium-version v1.0.0
 ```
 
 ---
@@ -238,16 +242,29 @@ cordyceps/
 ## Python Scanner Options
 
 ```bash
-# Download subcommand
+# Download
 python scanner.py download [-m MIN] [-p PAGES] [--per-page N] [-w WORKERS] \
                             [-o DIR] [-e DIR] [-c CSV] [--list-only]
 
-# Scan subcommand
-python scanner.py scan [-d EXTRACT_DIR] [-r REPORT_NAME] [-f {md,json,csv} ...]
+# Scan
+python scanner.py scan [-d EXTRACT_DIR] [-r REPORT_NAME] [-f {md,json,csv} ...] \
+                       [--fail-on {critical,high,medium,low,never}] [--quiet]
 
 # All-in-one
-python scanner.py all [all download + scan options combined]
+python scanner.py all [download options] [scan options]
 ```
+
+---
+
+## Troubleshooting
+
+| Symptom | Resolution |
+|---------|-----------|
+| `Mycelium binary not found` | Re-run the installer, or set `CORDYCEPS_MYCELIUM=/abs/path/to/mycelium`. |
+| `ripgrep (rg) not found, falling back to grep` | Install ripgrep: `apt install ripgrep` / `brew install ripgrep` / `winget install BurntSushi.ripgrep.MSVC`. |
+| Scanner reports 0 findings on a known-vulnerable plugin | Check that the plugin lives in a top-level subdirectory of `--extract-dir`, and isn't inside `vendor/` or `tests/` (those are skipped). |
+| Windows `cmd.exe` shows raw `\033[…m` codes | Set `NO_COLOR=1` or run via PowerShell / Windows Terminal. |
+| GitHub API rate limit during install | Set `GITHUB_TOKEN=<your_token>` before running `install.sh`. |
 
 ---
 
@@ -258,6 +275,8 @@ python scanner.py all [all download + scan options combined]
 | **Patchstack Academy** | 17 vulnerability types with WordPress-specific patterns | [patchstack.com/academy](https://patchstack.com/academy/wordpress/vulnerabilities/) |
 | **Mycelium** | WordPress.org plugin API bulk downloader | [github.com/zhugez/Mycelium](https://github.com/zhugez/Mycelium) |
 | **OpenClaw** | AI agent skill framework | [docs.openclaw.ai](https://docs.openclaw.ai/tools/skills) |
+| **Hermes Agent** | Agentic framework by NousResearch | [github.com/nousresearch/hermes-agent](https://github.com/nousresearch/hermes-agent) |
+| **agentskills.io** | Open skill spec used by both runtimes | [agentskills.io](https://agentskills.io) |
 
 ---
 
@@ -269,25 +288,26 @@ Not all findings are true vulnerabilities. Key context to consider:
 |---------------------|---------------------|
 | `$wpdb->query()` with `$_POST` | Properly wrapped in `$wpdb->prepare()` with `%s`/`%d` |
 | `$_GET` in SQL inside WP hooks | WordPress magic quotes auto-protect (unless `wp_unslash()` used) |
-| `sanitize_text_field()` before SQL | Prevents XSS but NOT SQLi -- still needs `prepare()` |
+| `sanitize_text_field()` before SQL | Prevents XSS but NOT SQLi - still needs `prepare()` |
 | `move_uploaded_file()` | May have proper extension whitelist check before it |
 | `wp_redirect()` | May be using hardcoded/validated URL, not user input |
 
 ---
 
-## Contributing
+## Contributing & Security
 
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/new-vuln-pattern`)
-3. Add new detection patterns to `SKILL.md` and `scanner.py`
-4. Test against real WordPress plugins
-5. Submit a Pull Request
+- See [CONTRIBUTING.md](CONTRIBUTING.md) for dev setup, pattern-writing
+  guidelines, and the test layout.
+- See [SECURITY.md](SECURITY.md) for the disclosure policy and supported scope.
+- See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ---
 
 ## Disclaimer
 
-This tool is intended for **authorized security testing and research only**. Always obtain proper authorization before scanning third-party WordPress installations. The authors are not responsible for any misuse of this tool.
+This tool is intended for **authorized security testing and research only**.
+Always obtain proper authorization before scanning third-party WordPress
+installations. The authors are not responsible for any misuse.
 
 ---
 

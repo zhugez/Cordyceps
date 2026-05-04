@@ -7,13 +7,27 @@ vuln_report.*
 scan_test.*
 cordyceps_report.*
 plugins.csv
+smoke_report.*
+
+# Mycelium binaries (downloaded by install.sh / install.ps1)
+mycelium
+mycelium.exe
+mycelium-linux-*
+mycelium-windows-*
+mycelium-darwin-*
 
 # Python
 __pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
+.ruff_cache/
 .venv/
 venv/
+env/
+build/
+dist/
+*.egg-info/
 
 # OS
 .DS_Store
@@ -26,3 +40,7 @@ desktop.ini
 *.swp
 *.swo
 *~
+
+# Local agent / tooling state
+.omc/
+.claude/

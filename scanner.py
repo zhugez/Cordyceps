@@ -149,6 +149,11 @@ CALLBACK_REG = re.compile(
 # `permission_callback` line that matched. 45 of 51 name it within 8 lines of that key.
 REST_CB = re.compile(
     r"""['"]callback['"]\s*=>\s*(?:(?:array\s*\(|\[)\s*[^,]+,\s*)?['"](\w+)['"]""")
+# `'callback' => function ( $request ) { ... }` -- the handler has no name to resolve because
+# its body is right there. 4 of 23 findings on the fresh corpus registered a route this way.
+REST_CB_CLOSURE = re.compile(r"""['"]callback['"]\s*=>\s*function\s*&?\s*\(""")
+# `$this->verify_signature(...)`, `self::check(...)`: the one hop out of a handler body.
+CALLEE = re.compile(r"(?:->|::)\s*(\w+)\s*\(")
 
 FAIL_ON_THRESHOLDS = {
     "critical": "CRITICAL",
@@ -463,9 +468,17 @@ class PatchstackScanner:
     # Measured over 100 plugins: 235 registrations, and 77% of the ones whose callback body
     # resolves guard inside that body. Unresolved callback -> emit, same as every other
     # fallback here: this can suppress only on positive evidence of a guard.
+    # `hash_equals`/`hash_hmac`: a webhook has no WordPress user to check a capability on, so
+    # its access check is a constant-time compare against a shared secret. That is the correct
+    # implementation, and it was 3 of the 23 remaining findings on the fresh corpus --
+    # linkerflow compares a stored nonce, listingkit an export token, avd-cta-insights a
+    # stats key. Deliberately not `WP_Error(` or `!== $expected`: scholar-sync returns
+    # `WP_Error('missing_id')` for a blank parameter and vova-post-grids for an unsupported
+    # sort order, and neither is an access check.
     GUARDS = re.compile(
         r"\b(current_user_can|current_user_can_for_blog|user_can|is_user_logged_in"
-        r"|check_ajax_referer|check_admin_referer|wp_verify_nonce|wp_die)\s*\(")
+        r"|check_ajax_referer|check_admin_referer|wp_verify_nonce|wp_die"
+        r"|hash_equals|hash_hmac)\s*\(")
 
     # A body that executes code is never suppressed, whatever the category. Unioned into
     # every gated check so a deprecated eval-equivalent cannot cause a false suppression;
@@ -768,6 +781,7 @@ class PatchstackScanner:
 
                     if vuln_type == "Broken Access Control":
                         handler = None
+                        body = None
                         if "wp_ajax_nopriv_" in line:
                             cb = CALLBACK_REG.search(line)
                             handler = cb.group(2) if cb else None
@@ -779,17 +793,39 @@ class PatchstackScanner:
                                 (j for j in range(max(1, i - 8), min(len(lines), i + 8) + 1)
                                  if REST_CB.search(lines[j - 1])),
                                 key=lambda j: abs(j - i))
-                            handler = REST_CB.search(lines[near[0] - 1]).group(1) if near else None
+                            if near:
+                                handler = REST_CB.search(lines[near[0] - 1]).group(1)
+                            else:
+                                # An inline closure has no name, but it does have a body:
+                                # the innermost span around its `function (` line.
+                                shut = sorted(
+                                    (j for j in range(max(1, i - 8), min(len(lines), i + 8) + 1)
+                                     if REST_CB_CLOSURE.search(lines[j - 1])),
+                                    key=lambda j: abs(j - i))
+                                if shut:
+                                    body = self._enclosing_span(spans, shut[0])
 
-                        if handler is not None:
+                        if handler is not None or body is not None:
                             # Same file first, then the plugin-wide index. Absence from both is
                             # not evidence -- an unresolvable handler still emits.
-                            body = next((s for s in spans if s[0] == handler), None)
-                            if body and self.GUARDS.search(
-                                    "\n".join(lines[body[1] - 1:body[2]])):
+                            if body is None:
+                                body = next((s for s in spans if s[0] == handler), None)
+                            text = "\n".join(lines[body[1] - 1:body[2]]) if body else ""
+                            if text and self.GUARDS.search(text):
+                                continue
+                            # One hop: payslate's Stripe webhook does its own signature check,
+                            # but inside `$this->verify_signature()`. 4 of 23 findings on the
+                            # fresh corpus guard themselves exactly one call out.
+                            # ponytail: same plugin, by name, one level. A guard behind two
+                            # hops or in a parent class is still missed; a real call graph is
+                            # the upgrade path, and it is a different tool.
+                            if text and self._guarded.intersection(CALLEE.findall(text)):
                                 continue
                             if handler in self._guarded:
                                 continue
+                            if handler is None:
+                                # Nameless, so dedup on where the body starts instead.
+                                handler = f"closure@{rel_path}:{body[1]}"
 
                             # One handler bound to 52 hook names is one lead, not 52.
                             # echo-knowledge-base alone was 52 of the 206 findings here.

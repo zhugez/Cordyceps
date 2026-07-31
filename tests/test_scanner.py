@@ -308,6 +308,44 @@ def test_reading_an_upload_without_writing_it_is_not_an_upload_bug(tmp_path: Pat
     assert lines == {8}, f"only the scope that writes the upload is a lead: got {sorted(lines)}"
 
 
+def test_webhook_that_checks_its_own_secret_is_not_broken_access_control(tmp_path: Path) -> None:
+    """7 of 23 BAC findings on the fresh corpus guarded themselves, 4 of them one call out."""
+    plugin = tmp_path / "hook_plugin"
+    plugin.mkdir()
+    (plugin / "hook.php").write_text(
+        "<?php\n"
+        "class Hooks {\n"
+        "    public function register() {\n"
+        "        register_rest_route( 'x/v1', '/paid', array(\n"
+        "            'methods'             => 'POST',\n"
+        "            'callback'            => array( $this, 'handle' ),\n"
+        "            'permission_callback' => '__return_true',\n"
+        "        ) );\n"
+        "        register_rest_route( 'x/v1', '/stats', array(\n"
+        "            'methods'             => 'GET',\n"
+        "            'callback'            => array( $this, 'stats' ),\n"
+        "            'permission_callback' => '__return_true',\n"
+        "        ) );\n"
+        "    }\n"
+        # The check is one hop out, in a helper -- payslate's Stripe webhook exactly.
+        "    public function handle( $request ) {\n"
+        "        if ( ! $this->verify_signature( $request ) ) {\n"
+        "            return new WP_Error( 'bad_sig', 'no' );\n"
+        "        }\n"
+        "        return rest_ensure_response( array( 'ok' => true ) );\n"
+        "    }\n"
+        "    private function verify_signature( $request ) {\n"
+        "        return hash_equals( get_option( 'x_secret' ), $request->get_header( 'x-sig' ) );\n"
+        "    }\n"
+        "    public function stats( $request ) {\n"
+        "        return rest_ensure_response( get_option( 'x_stats' ) );\n"
+        "    }\n"
+        "}\n"
+    )
+    lines = {f.line for f in _scan(tmp_path).findings if f.vuln_type == "Broken Access Control"}
+    assert lines == {12}, f"only the route with no check anywhere is a lead: got {sorted(lines)}"
+
+
 def test_comment_lines_are_never_findings(tmp_path: Path) -> None:
     """A `@see \\ZipArchive::extractTo()` docblock was reported CRITICAL. 10/844 sat on comments."""
     plugin = tmp_path / "comment_plugin"

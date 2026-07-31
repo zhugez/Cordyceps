@@ -184,7 +184,10 @@ def _only_prepared(call: str, names: set[str]) -> bool:
 
 # add_action('wp_ajax_nopriv_x', 'cb') / (..., array($this, 'cb')) / (..., [$this, 'cb'])
 CALLBACK_REG = re.compile(
-    r"""['"](wp_ajax_nopriv_|wp_ajax_)[^'"]*['"]\s*,\s*"""
+    # `add_action( 'wp_ajax_nopriv_' . self::ACTION, [ $this, 'handle' ] )` -- the hook name is
+    # built by concatenation, so the quote does not end at the comma. Everything up to the first
+    # comma still belongs to the hook, and the callback starts after it.
+    r"""['"](wp_ajax_nopriv_|wp_ajax_)[^'"]*['"][^,)]*,\s*"""
     # Three registration forms: a bare function name, `array($obj, 'method')`, and the
     # WordPress Plugin Boilerplate loader's `add_action($hook, $obj, 'method')`. The third
     # was 27 of the 71 nopriv findings whose handler name could not be read at all.

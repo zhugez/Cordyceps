@@ -895,3 +895,28 @@ def test_a_403_and_a_nonce_dispenser_are_not_broken_access_control(tmp_path: Pat
     )
     lines = {f.line for f in _scan(tmp_path).findings if f.vuln_type == "Broken Access Control"}
     assert lines == {13}, f"only the route that authorises nothing is a lead: got {sorted(lines)}"
+
+
+def test_a_concatenated_hook_name_still_resolves_its_handler(tmp_path: Path) -> None:
+    """`'wp_ajax_nopriv_' . self::ACTION` hid the callback, so a guarded handler still emitted."""
+    plugin = tmp_path / "ajax_plugin"
+    plugin.mkdir()
+    (plugin / "a.php").write_text(
+        "<?php\n"
+        "class Cordyceps_Sub {\n"
+        "    const ACTION = 'cordyceps_subscribe';\n"
+        "    public function register() {\n"
+        "        add_action( 'wp_ajax_nopriv_' . self::ACTION, array( $this, 'handle' ) );\n"
+        "        add_action( 'wp_ajax_nopriv_' . self::ACTION . '_open', array( $this, 'open' ) );\n"
+        "    }\n"
+        "    public function handle() {\n"
+        "        check_ajax_referer( self::ACTION, 'nonce' );\n"
+        "        update_option( 'sub', sanitize_text_field( wp_unslash( $_POST['email'] ) ) );\n"
+        "    }\n"
+        "    public function open() {\n"
+        "        update_option( 'sub', sanitize_text_field( wp_unslash( $_POST['email'] ) ) );\n"
+        "    }\n"
+        "}\n"
+    )
+    lines = {f.line for f in _scan(tmp_path).findings if f.vuln_type == "Broken Access Control"}
+    assert lines == {6}, f"only the unguarded handler is a lead: got {sorted(lines)}"

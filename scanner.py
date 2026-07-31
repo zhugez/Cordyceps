@@ -65,6 +65,14 @@ VAR_NAME = re.compile(r"\$(\w+)")
 ASSIGN = re.compile(r"\$(\w+)\s*(?:\[[^\]]*\])?\s*\.?=(?![=>])")
 # End of a statement or of a block: where the backward scan for the statement start stops.
 STMT_BREAK = re.compile(r"[;{}]")
+# `$wpdb->prepare( // phpcs:ignore ... -- values %-prepared.` -- a `;` inside a trailing comment
+# ended the backward scan one line early, so the window that had to prove the call was a
+# `prepare()` started below it. Both langforge false positives were exactly this.
+# ponytail: `//` inside a string literal splits too, which only widens the window. A tokenizer
+# is the upgrade path, and it is a different tool.
+LINE_COMMENT = re.compile(r"//.*$|#(?!\[).*$")
+# `implode(',', array_fill(0, count($ids), '%d'))`: a list of placeholders, not of values.
+PLACEHOLDER_LIST = re.compile(r"array_fill\s*\([\s\S]{0,80}?['\"]%[a-z]['\"]")
 
 # Line whose first non-space token opens or continues a comment. `#[` is a PHP 8 attribute.
 COMMENT_LINE = re.compile(r"\s*(//|#(?!\[)|\*|/\*)")
@@ -136,6 +144,34 @@ def _all_escaped(line: str, safe: frozenset[str], spots_re: re.Pattern = SUPERGL
             continue
         covered.update(s for s in spots if m.end() <= s < i)
     return len(covered) == len(spots)
+
+
+# A quoted PHP string. Only double quotes interpolate, but a value concatenated onto a
+# single-quoted string lands in the SQL text just the same, so both count as "inside the SQL".
+STRING_LIT = re.compile(r"'[^']*'|\"[^\"]*\"")
+
+
+def _only_prepared(call: str, names: set[str]) -> bool:
+    """True when every tainted name in this sink call is an argument to `$wpdb->prepare()`.
+
+    `prepare()` is in the SQL sink set because it takes a SQL string -- and it is also the fix.
+    WordPress escapes each argument against its placeholder, so `prepare('… = %s', $x)` is safe
+    and `prepare("… = $x")` is not. The difference is whether the name appears inside the format
+    string. 11 of 14 surviving SQL Injection findings on the fresh corpus were the safe form:
+    veltrixo's `%s` lookups behind a nonce and `manage_options`, scholar-sync's `%i`/`%s`,
+    lumo-forms' `$where` built by `prepare()` before interpolation.
+
+    Suppresses on proof: a name anywhere inside any string literal keeps the finding, and a
+    call with no `prepare()` at all is never suppressed -- `$sql = "… $id"; $wpdb->query($sql);`
+    still reports, because taint reaches `$sql` and its sink statement has no `prepare`.
+
+    ponytail: a string whose closing quote falls outside the 10-line window pairs up wrong.
+    A PHP tokenizer is the upgrade path, and it is a different tool.
+    """
+    if "prepare" not in call:
+        return False
+    return not any(re.search(rf"\${re.escape(n)}\b", lit)
+                   for lit in STRING_LIT.findall(call) for n in names)
 
 # add_action('wp_ajax_nopriv_x', 'cb') / (..., array($this, 'cb')) / (..., [$this, 'cb'])
 CALLBACK_REG = re.compile(
@@ -426,7 +462,10 @@ class PatchstackScanner:
             r"|\bmysqli?_query\s*\("
             # Statement-shaped, not bare keywords: `\bSELECT\b` alone also matches the
             # HTML tag `<select>`, which kept 632/1426 findings alive on nothing.
-            r"|\bSELECT\b[\s\S]{0,200}?\bFROM\b|\bUPDATE\b[\s\S]{0,200}?\bSET\b"
+            # Statement-shaped is still not enough: `<select name="from">` supplies both halves,
+            # and was the last SQL Injection false positive left on the fresh corpus. A `<` or
+            # `/` immediately before the keyword means markup, never SQL.
+            r"|(?<![<\/])\bSELECT\b[\s\S]{0,200}?\bFROM\b|\bUPDATE\b[\s\S]{0,200}?\bSET\b"
             r"|\bINSERT\s+INTO\b|\bDELETE\s+FROM\b|\bREPLACE\s+INTO\b|\bTRUNCATE\s+TABLE\b",
             re.IGNORECASE),
         "Server-Side Request Forgery (SSRF)": re.compile(
@@ -655,17 +694,39 @@ class PatchstackScanner:
         for n in range(last + 1, end + 1):
             line = lines[n - 1]
             if sink.search(line):
-                # A sink call's arguments often run onto the next lines.
-                if tainted & set(VAR_NAME.findall("\n".join(lines[n - 1:min(end, n + 2)]))):
+                # The sink is a statement too, and the SQL string usually is not the line the
+                # call opens on: `$wpdb->get_var( $wpdb->prepare(` / `'SELECT … %s'` / `$id );`
+                # matched on the middle line, so a forward-only window never saw the `prepare`.
+                back = n
+                while (back > last + 1 and n - back < 10
+                       and not STMT_BREAK.search(LINE_COMMENT.sub("", lines[back - 2]))):
+                    back -= 1
+                stop = n
+                while stop < end and ";" not in lines[stop - 1] and stop - n < 10:
+                    stop += 1
+                call = "\n".join(lines[back - 1:stop])
+                hits = tainted & set(VAR_NAME.findall(call))
+                if hits and not _only_prepared(call, hits):
                     return True
             names = ASSIGN.findall(line)
             if names:
                 pending = names[-1]
-                if tainted & set(VAR_NAME.findall(line.split("=", 1)[1])):
-                    tainted.add(pending)
-            elif pending and tainted & set(VAR_NAME.findall(line)):
+                rhs = line.split("=", 1)[1]
+            else:
                 # `$sql = "SELECT ...` on one line, the interpolated value on the next.
-                tainted.add(pending)
+                rhs = line
+            if pending:
+                # `$where = $wpdb->prepare(' AND s.status = %s', $status_filter);` launders the
+                # value: what comes back is escaped SQL text, so interpolating it further down
+                # is the documented idiom, not a bug. lumo-forms builds every WHERE this way.
+                # `implode(',', array_fill(0, count($ids), '%d'))` launders it too, harder: the
+                # tainted value decides how MANY placeholders, never what is in them, so the
+                # result is the literal `%d,%d,%d`. That is the documented way to write
+                # `IN (...)` with prepare, and it is what langforge and lens-ai both do.
+                if "prepare" in line or PLACEHOLDER_LIST.search(line):
+                    tainted.discard(pending)
+                elif tainted & set(VAR_NAME.findall(rhs)):
+                    tainted.add(pending)
             if ";" in line:
                 pending = None
         return False

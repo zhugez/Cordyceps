@@ -761,3 +761,66 @@ def test_array_element_use_site_is_the_statement(tmp_path: Path) -> None:
     # The unrelated query on line 4 satisfies the span-level sink gate; the statement the
     # value actually lives in is a redirect, so it is not a lead.
     assert findings == [], f"a redirect argument is not a SQL lead, got {findings}"
+
+
+def test_prepare_argument_is_escaped_but_interpolation_is_not(tmp_path: Path) -> None:
+    """11 of 14 surviving SQL leads on the fresh corpus were the safe `prepare(…, $x)` form."""
+    plugin = tmp_path / "prep_plugin"
+    plugin.mkdir()
+    (plugin / "p.php").write_text(
+        "<?php\n"
+        "function cordyceps_safe() {\n"
+        "    global $wpdb;\n"
+        "    $slug = sanitize_text_field( wp_unslash( $_GET['slug'] ) );\n"
+        "    return $wpdb->get_var( $wpdb->prepare(\n"
+        "        \"SELECT name FROM {$wpdb->prefix}items WHERE slug = %s\",\n"
+        "        $slug\n"
+        "    ) );\n"
+        "}\n"
+        "function cordyceps_unsafe() {\n"
+        "    global $wpdb;\n"
+        "    $id = wp_unslash( $_GET['id'] );\n"
+        "    $sql = \"SELECT name FROM {$wpdb->prefix}items WHERE id = $id\";\n"
+        "    return $wpdb->get_var( $sql );\n"
+        "}\n"
+    )
+    lines = {f.line for f in _scan(tmp_path).findings if f.vuln_type == "SQL Injection"}
+    assert lines == {12}, f"only the interpolated one is a lead: got {sorted(lines)}"
+
+
+def test_placeholder_list_and_prepared_fragment_are_not_tainted(tmp_path: Path) -> None:
+    """`IN (%d,%d)` built by array_fill, and a WHERE built by prepare, are the documented idiom."""
+    plugin = tmp_path / "ph_plugin"
+    plugin.mkdir()
+    (plugin / "ph.php").write_text(
+        "<?php\n"
+        "function cordyceps_in_clause() {\n"
+        "    global $wpdb;\n"
+        "    $ids = array_map( 'intval', wp_unslash( $_POST['ids'] ) );\n"
+        "    $ph = implode( ',', array_fill( 0, count( $ids ), '%d' ) );\n"
+        "    $where = $wpdb->prepare( ' AND status = %s', sanitize_key( $_POST['status'] ) );\n"
+        "    return $wpdb->get_col( $wpdb->prepare(\n"
+        "        \"SELECT id FROM {$wpdb->prefix}t WHERE id IN ($ph) $where\",\n"
+        "        ...$ids\n"
+        "    ) );\n"
+        "}\n"
+    )
+    findings = [f for f in _scan(tmp_path).findings if f.vuln_type == "SQL Injection"]
+    assert findings == [], f"placeholders and prepared fragments carry no value, got {findings}"
+
+
+def test_html_select_tag_is_not_a_sql_statement(tmp_path: Path) -> None:
+    """`<select name="from">` supplies both halves of `SELECT … FROM` under IGNORECASE."""
+    plugin = tmp_path / "html_plugin"
+    plugin.mkdir()
+    (plugin / "h.php").write_text(
+        "<?php\n"
+        "function cordyceps_form() {\n"
+        "    $from = sanitize_key( wp_unslash( $_GET['from'] ) );\n"
+        "    echo '<select name=\"from\">';\n"
+        "    echo '<option>' . esc_html( $from ) . '</option>';\n"
+        "    echo '</select>';\n"
+        "}\n"
+    )
+    findings = [f for f in _scan(tmp_path).findings if f.vuln_type == "SQL Injection"]
+    assert findings == [], f"markup is not a SQL sink, got {findings}"

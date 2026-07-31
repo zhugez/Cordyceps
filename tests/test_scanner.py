@@ -920,3 +920,28 @@ def test_a_concatenated_hook_name_still_resolves_its_handler(tmp_path: Path) -> 
     )
     lines = {f.line for f in _scan(tmp_path).findings if f.vuln_type == "Broken Access Control"}
     assert lines == {6}, f"only the unguarded handler is a lead: got {sorted(lines)}"
+
+
+def test_a_request_value_used_only_as_an_array_key_is_whitelisted(tmp_path: Path) -> None:
+    """alkapay's log viewer: the sink reads an element of a glob()-filled array, not the request."""
+    plugin = tmp_path / "log_plugin"
+    plugin.mkdir()
+    (plugin / "v.php").write_text(
+        "<?php\n"
+        "function cordyceps_view() {\n"
+        "    $picked = isset($_GET['log']) ? sanitize_text_field(wp_unslash($_GET['log'])) : '';\n"
+        "    $logs = array();\n"
+        "    foreach (glob('/var/log/*.log') as $f) {\n"
+        "        $logs[basename($f)] = array('file' => $f);\n"
+        "    }\n"
+        "    if ($picked && isset($logs[$picked])) {\n"
+        "        echo esc_html(file_get_contents($logs[$picked]['file']));\n"
+        "    }\n"
+        "}\n"
+        "function cordyceps_raw() {\n"
+        "    $picked = isset($_GET['log']) ? sanitize_text_field(wp_unslash($_GET['log'])) : '';\n"
+        "    echo esc_html(file_get_contents('/var/log/' . $picked));\n"
+        "}\n"
+    )
+    lines = {f.line for f in _scan(tmp_path).findings if f.vuln_type == "Arbitrary File Read"}
+    assert lines == {13}, f"only the concatenated path is a lead: got {sorted(lines)}"

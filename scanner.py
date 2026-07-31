@@ -182,6 +182,26 @@ def _only_prepared(call: str, names: set[str]) -> bool:
     return not any(re.search(rf"\${re.escape(n)}\b", lit)
                    for lit in STRING_LIT.findall(call) for n in names)
 
+def _only_indexed(call: str, names: set[str]) -> bool:
+    """True when every tainted name in this sink call is only a key into a plugin-built array.
+
+    `file_get_contents( $log_files[ $selected_log ]['file'] )` never passes the request value to
+    the sink: it passes an element of an array the plugin filled from `glob()`. An index that is
+    not in the array yields null, so the whitelist holds whether or not an `isset()` guards it.
+    alkapay's log viewer is exactly this, and it was the last Arbitrary File Read false positive
+    with a readable cause.
+
+    Superglobals are excluded by name -- `$_GET['file']` is the source, not a whitelist.
+
+    ponytail: an array the request also fills (`$paths[$k] = $_POST[$k]`) reads as a whitelist
+    here. Tracking taint into array elements is the upgrade path; nothing on the corpus needs it.
+    """
+    return all(
+        len(re.findall(rf"\${re.escape(n)}\b", call))
+        == len(re.findall(rf"\$(?!_[A-Z])\w+\s*\[\s*\${re.escape(n)}\s*\]", call))
+        for n in names)
+
+
 # add_action('wp_ajax_nopriv_x', 'cb') / (..., array($this, 'cb')) / (..., [$this, 'cb'])
 CALLBACK_REG = re.compile(
     # `add_action( 'wp_ajax_nopriv_' . self::ACTION, [ $this, 'handle' ] )` -- the hook name is
@@ -737,7 +757,7 @@ class PatchstackScanner:
                     stop += 1
                 call = "\n".join(lines[back - 1:stop])
                 hits = tainted & set(VAR_NAME.findall(call))
-                if hits and not _only_prepared(call, hits):
+                if hits and not _only_prepared(call, hits) and not _only_indexed(call, hits):
                     return True
             names = ASSIGN.findall(line)
             if names:

@@ -858,3 +858,40 @@ def test_sanitize_key_output_cannot_carry_a_tag(tmp_path: Path) -> None:
     lines = {f.line for f in _scan(tmp_path).findings if "Cross-Site" in f.vuln_type}
     # sanitize_text_field strips tags but keeps quotes: still XSS in an unquoted attribute.
     assert lines == {4}, f"only the quote-preserving sanitizer is a lead: got {sorted(lines)}"
+
+
+def test_a_403_and_a_nonce_dispenser_are_not_broken_access_control(tmp_path: Path) -> None:
+    """7 of 16 BAC findings: 3 handlers answer 401/403, 4 hand out a nonce and nothing else."""
+    plugin = tmp_path / "route_plugin"
+    plugin.mkdir()
+    (plugin / "r.php").write_text(
+        "<?php\n"
+        "function cordyceps_routes() {\n"
+        "    register_rest_route( 'x/v1', '/hook', array(\n"
+        "        'callback'            => 'cordyceps_hook',\n"
+        "        'permission_callback' => '__return_true',\n"
+        "    ) );\n"
+        "    register_rest_route( 'x/v1', '/nonce', array(\n"
+        "        'callback'            => 'cordyceps_nonce',\n"
+        "        'permission_callback' => '__return_true',\n"
+        "    ) );\n"
+        "    register_rest_route( 'x/v1', '/wipe', array(\n"
+        "        'callback'            => 'cordyceps_wipe',\n"
+        "        'permission_callback' => '__return_true',\n"
+        "    ) );\n"
+        "}\n"
+        "function cordyceps_hook( $request ) {\n"
+        "    if ( $request->get_header( 'x-secret' ) !== get_option( 'my_secret' ) ) {\n"
+        "        return new WP_REST_Response( array( 'ok' => false ), 403 );\n"
+        "    }\n"
+        "    return new WP_REST_Response( array( 'ok' => true ), 200 );\n"
+        "}\n"
+        "function cordyceps_nonce() {\n"
+        "    return wp_create_nonce( 'my_action' );\n"
+        "}\n"
+        "function cordyceps_wipe( $request ) {\n"
+        "    delete_option( $request->get_param( 'key' ) );\n"
+        "}\n"
+    )
+    lines = {f.line for f in _scan(tmp_path).findings if f.vuln_type == "Broken Access Control"}
+    assert lines == {13}, f"only the route that authorises nothing is a lead: got {sorted(lines)}"

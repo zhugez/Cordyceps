@@ -199,6 +199,15 @@ REST_CB = re.compile(
 REST_CB_CLOSURE = re.compile(r"""['"]callback['"]\s*=>\s*function\s*&?\s*\(""")
 # `$this->verify_signature(...)`, `self::check(...)`: the one hop out of a handler body.
 CALLEE = re.compile(r"(?:->|::)\s*(\w+)\s*\(")
+# An HTTP status a handler only sends when it is refusing the caller.
+DENIES = re.compile(r"\b40[13]\b")
+NONCE_ISSUER = re.compile(r"\bwp_create_nonce\s*\(")
+# More than a nonce dispenser: reads the request, or touches state.
+NOT_JUST_A_NONCE = re.compile(
+    r"\$_(GET|POST|REQUEST|COOKIE|FILES|SERVER)\b"
+    r"|->\s*get_(param|params|body|header|json_params)\s*\("
+    r"|\$wpdb\b|\b(update|delete|insert|add)_(option|post_meta|user_meta|term_meta)\s*\("
+    r"|\bwp_(insert|update|delete)_\w+\s*\(|\bfile_put_contents\s*\(|\bunlink\s*\(")
 
 FAIL_ON_THRESHOLDS = {
     "critical": "CRITICAL",
@@ -902,6 +911,21 @@ class PatchstackScanner:
                             if text and self._guarded.intersection(CALLEE.findall(text)):
                                 continue
                             if handler in self._guarded:
+                                continue
+                            # A handler that can answer 401 or 403 has an access check --
+                            # that is what those codes mean. 3 of the 16 remaining findings,
+                            # all three hand-read: qbitflow verifies an HMAC through its own
+                            # API and returns 401, echoping compares a Telegram secret header
+                            # and returns 403, payslate 403s an invoice that may not be paid.
+                            if text and DENIES.search(text):
+                                continue
+                            # A route whose whole body is `return wp_create_nonce(...)` hands
+                            # out the token the *next* request is checked against. It reads no
+                            # input and changes no state, so there is nothing to authorise --
+                            # 4 of 16, australcode and epfolio refreshing a nonce that a
+                            # full-page cache has staled, tsjippy as an inline closure.
+                            if (text and NONCE_ISSUER.search(text)
+                                    and not NOT_JUST_A_NONCE.search(text)):
                                 continue
                             if handler is None:
                                 # Nameless, so dedup on where the body starts instead.

@@ -35,6 +35,10 @@ EXCLUDE_DIRS = {
     # php-scoper output. Third-party code with a plugin-local namespace, and the only
     # place a `create_function()` survived to the top of the report.
     "vendor_prefixed",
+    # The Freemius SDK, vendored verbatim by hundreds of plugins and not under `vendor/`.
+    # A bug in it belongs to Freemius, not to the plugin that bundled it, and it would be
+    # reported once per bundling plugin. Same rationale as `vendor_prefixed` above.
+    "freemius",
     "node_modules",
     "tests",
     "test",
@@ -106,6 +110,11 @@ NUMERIC_SAFE = frozenset({"intval", "absint", "floatval", "count", "sizeof"})
 OUTPUT_SAFE = frozenset({
     "esc_attr", "esc_html", "esc_url", "esc_js", "esc_textarea",
     "esc_attr_e", "esc_html_e", "wp_kses", "wp_kses_post",
+    # Sanitizers whose output cannot contain `< > " '` at all, so it is safe in any HTML
+    # context, quoted or not. `sanitize_text_field` is deliberately absent: it strips tags
+    # but keeps quotes, which is still XSS inside an unquoted attribute.
+    "sanitize_key", "sanitize_html_class", "sanitize_hex_color", "sanitize_title",
+    "sanitize_file_name",
 })
 # A nonce check is the defence, not the bug. The first false positive ever reported against
 # this scanner was `wp_verify_nonce(sanitize_text_field(wp_unslash($_POST[...])))` labelled
@@ -499,7 +508,17 @@ class PatchstackScanner:
     # Output escapers only prove safety for the category whose sink is output. Every other
     # rule keeps its finding unless the value was cast to a number.
     DEFAULT_SAFE = NUMERIC_SAFE | NONCE_SAFE
-    ESCAPERS = {"Cross-Site Scripting (XSS)": DEFAULT_SAFE | OUTPUT_SAFE}
+    # `basename()` and `sanitize_file_name()` exist to defeat `../`: a name that has been through
+    # either cannot leave the directory the sink builds for it. 2 of the 4 Arbitrary File Read
+    # findings on the fresh corpus were `basename( sanitize_file_name( wp_unslash( $_GET[..] ) ) )`
+    # -- the eighth rule found flagging its own remediation. Not `realpath()`, which resolves a
+    # traversal rather than preventing it, and not `str_replace('..', '', ..)`, which `....//` beats.
+    PATH_SAFE = frozenset({"basename", "wp_basename", "sanitize_file_name"})
+    ESCAPERS = {
+        "Cross-Site Scripting (XSS)": DEFAULT_SAFE | OUTPUT_SAFE,
+        "Arbitrary File Read": DEFAULT_SAFE | PATH_SAFE,
+        "Arbitrary File Deletion": DEFAULT_SAFE | PATH_SAFE,
+    }
     # What has to be proven escaped, per category. Default: every superglobal on the line.
     SPOTS = {"Cross-Site Scripting (XSS)": XSS_SPOT}
 

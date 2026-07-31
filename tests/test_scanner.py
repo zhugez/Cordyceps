@@ -824,3 +824,37 @@ def test_html_select_tag_is_not_a_sql_statement(tmp_path: Path) -> None:
     )
     findings = [f for f in _scan(tmp_path).findings if f.vuln_type == "SQL Injection"]
     assert findings == [], f"markup is not a SQL sink, got {findings}"
+
+
+def test_basename_defeats_traversal_but_a_raw_name_does_not(tmp_path: Path) -> None:
+    """2 of 4 file-read findings were `basename( sanitize_file_name( wp_unslash( $_GET ) ) )`."""
+    plugin = tmp_path / "log_plugin"
+    plugin.mkdir()
+    (plugin / "l.php").write_text(
+        "<?php\n"
+        "function cordyceps_show_log() {\n"
+        "    $name = basename( sanitize_file_name( wp_unslash( $_GET['log_file'] ) ) );\n"
+        "    echo file_get_contents( WP_CONTENT_DIR . '/logs/' . $name );\n"
+        "}\n"
+        "function cordyceps_show_any() {\n"
+        "    echo file_get_contents( WP_CONTENT_DIR . '/logs/' . wp_unslash( $_GET['f'] ) );\n"
+        "}\n"
+    )
+    lines = {f.line for f in _scan(tmp_path).findings if f.vuln_type == "Arbitrary File Read"}
+    assert lines == {7}, f"only the un-basenamed path is a lead: got {sorted(lines)}"
+
+
+def test_sanitize_key_output_cannot_carry_a_tag(tmp_path: Path) -> None:
+    """`sanitize_key()` leaves only `[a-z0-9_-]`, so its output is safe in any HTML context."""
+    plugin = tmp_path / "key_plugin"
+    plugin.mkdir()
+    (plugin / "k.php").write_text(
+        "<?php\n"
+        "function cordyceps_render() {\n"
+        "    echo '<div class=' . sanitize_key( wp_unslash( $_GET['tab'] ) ) . '>';\n"
+        "    echo '<div class=' . sanitize_text_field( wp_unslash( $_GET['other'] ) ) . '>';\n"
+        "}\n"
+    )
+    lines = {f.line for f in _scan(tmp_path).findings if "Cross-Site" in f.vuln_type}
+    # sanitize_text_field strips tags but keeps quotes: still XSS in an unquoted attribute.
+    assert lines == {4}, f"only the quote-preserving sanitizer is a lead: got {sorted(lines)}"

@@ -51,6 +51,21 @@ SEVERITY_RANK = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
 
 FUNC_DECL = re.compile(r"\bfunction\s+&?\s*(\w+)\s*\(")
 
+# Anonymous closures are function bodies too, and the name is optional here on purpose.
+# `add_action('wp_ajax_x', function() { ... })` is the modern registration idiom; a nameless
+# body resolved to no span at all, so scope fell back to the whole file -- the sink gate passed
+# on any `$wpdb` anywhere in the file, the one-lead-per-function dedup never fired, and a
+# `current_user_can()` two lines above the match was invisible. The empty name is harmless:
+# every lookup keyed by name (callback exposure, the guard index, BAC handlers) searches for a
+# `\w+` that can never be "".
+ANON_OK = re.compile(r"\bfunction\s*&?\s*(\w*)\s*\(")
+
+VAR_NAME = re.compile(r"\$(\w+)")
+# `$x =`, `$x['k'] =`, `$x .=` -- never `==`, `!=`, `>=`, `<=` or the `=>` of an array literal.
+ASSIGN = re.compile(r"\$(\w+)\s*(?:\[[^\]]*\])?\s*\.?=(?![=>])")
+# End of a statement or of a block: where the backward scan for the statement start stops.
+STMT_BREAK = re.compile(r"[;{}]")
+
 # Line whose first non-space token opens or continues a comment. `#[` is a PHP 8 attribute.
 COMMENT_LINE = re.compile(r"\s*(//|#(?!\[)|\*|/\*)")
 
@@ -70,6 +85,12 @@ def _probe(line: str) -> str:
 
 SUPERGLOBAL = re.compile(r"\$_(?:GET|POST|REQUEST|COOKIE|SERVER|FILES)\s*\[")
 
+# `add_query_arg()` reads the current `$_SERVER['REQUEST_URI']` without naming a superglobal,
+# so the escape check had nothing to look at and every `echo esc_url(add_query_arg(...))` was
+# reported: 28 of 28 such findings on the fresh corpus were already escaped that way. Treat the
+# call itself as the tainted spot and the existing proof-of-escape rule does the rest.
+XSS_SPOT = re.compile(SUPERGLOBAL.pattern + r"|\b(?:add|remove)_query_arg\s*\(")
+
 # Wrappers that prove the value they enclose is not the bug the rule describes. `intval`
 # makes a value harmless everywhere; `esc_attr` only makes it harmless as output, so the
 # two sets are applied to different categories.
@@ -87,7 +108,7 @@ NONCE_SAFE = frozenset({
 })
 
 
-def _all_escaped(line: str, safe: frozenset[str]) -> bool:
+def _all_escaped(line: str, safe: frozenset[str], spots_re: re.Pattern = SUPERGLOBAL) -> bool:
     """True when EVERY superglobal on the line sits inside a closed call to a `safe` function.
 
     `echo esc_attr($_GET['x'])` is the fix the XSS rule recommends, not the bug it looks
@@ -95,7 +116,7 @@ def _all_escaped(line: str, safe: frozenset[str]) -> bool:
     occurrence keeps the finding -- this suppresses on proof, never on a majority. A call
     whose parenthesis does not close on this line proves nothing and is ignored.
     """
-    spots = [m.start() for m in SUPERGLOBAL.finditer(line)]
+    spots = [m.start() for m in spots_re.finditer(line)]
     if not spots:
         return False
     covered: set[int] = set()
@@ -389,7 +410,14 @@ class PatchstackScanner:
     # provably a no-op. Measured 541 -> 540 over 222 plugins before the entry was removed.
     SINKS = {
         "SQL Injection": re.compile(
-            r"\$wpdb\b|->\s*(query|get_var|get_row|get_col|get_results|prepare)\s*\("
+            # A bare `$wpdb` used to count as a sink. It is not one: `$wpdb->insert/update/
+            # delete/replace` build their own prepared statement and escape every value against
+            # the column format, and `global $wpdb;` proves nothing at all. 24 of 80 SQLi
+            # findings on the fresh corpus survived on it alone -- 22 in scopes whose only
+            # `$wpdb` use was the escaping API, one on `$wpdb->db_version()`, one on a comment
+            # that mentioned `$wpdb`. Zero were real. A method that takes a SQL string still
+            # matches below, whether the string is built on that line or three lines up.
+            r"->\s*(query|get_var|get_row|get_col|get_results|prepare)\s*\("
             r"|\bmysqli?_query\s*\("
             # Statement-shaped, not bare keywords: `\bSELECT\b` alone also matches the
             # HTML tag `<select>`, which kept 632/1426 findings alive on nothing.
@@ -404,6 +432,17 @@ class PatchstackScanner:
             r"\b(file_get_contents|readfile|fread|fgets|fgetcsv|highlight_file|show_source|file)\s*\("
             r"|\bSplFileObject\b"),
         "Arbitrary File Deletion": re.compile(r"\b(unlink|wp_delete_file|rmdir)\s*\("),
+        # Reading `$_FILES` is not the bug -- writing what it points at is. The rule's own
+        # text was "verify file type validation", a hedge, and all 14 findings on the fresh
+        # corpus were scopes that never wrote the upload at all: CSV parsers reading
+        # `tmp_name`, and one handler that whitelists the mime type and hands the file to
+        # `media_handle_sideload()`. `wp_handle_upload`/`media_handle_upload` are deliberately
+        # absent: WordPress rejects dangerous extensions inside them, so routing an upload
+        # through one is the fix. ponytail: a scope that only forwards `$_FILES` to another
+        # function that writes it is missed, the same one-hop ceiling as every other gate.
+        "Arbitrary File Upload": re.compile(
+            r"\bmove_uploaded_file\s*\(|\b(?:copy|rename|file_put_contents|fwrite)\s*\("
+            r"|->\s*extractTo\s*\("),
         "Open Redirect": re.compile(
             r"\bwp_(safe_)?redirect\s*\(|\bheader\s*\(\s*['\"]\s*Location\s*:"),
         "Privilege Escalation": re.compile(
@@ -417,6 +456,8 @@ class PatchstackScanner:
     # rule keeps its finding unless the value was cast to a number.
     DEFAULT_SAFE = NUMERIC_SAFE | NONCE_SAFE
     ESCAPERS = {"Cross-Site Scripting (XSS)": DEFAULT_SAFE | OUTPUT_SAFE}
+    # What has to be proven escaped, per category. Default: every superglobal on the line.
+    SPOTS = {"Cross-Site Scripting (XSS)": XSS_SPOT}
 
     # A nopriv registration is a finding only when the handler it names checks nothing.
     # Measured over 100 plugins: 235 registrations, and 77% of the ones whose callback body
@@ -540,7 +581,7 @@ class PatchstackScanner:
         line_starts = [0]
         line_starts.extend(i + 1 for i, char in enumerate(text) if char == "\n")
         spans = []
-        for match in FUNC_DECL.finditer(text):
+        for match in ANON_OK.finditer(text):
             body = cls._match_body(text, match.end())
             if body is None:
                 continue
@@ -561,6 +602,60 @@ class PatchstackScanner:
             if span[1] <= line <= span[2] and (best is None or span[1] > best[1]):
                 best = span
         return best
+
+    @staticmethod
+    def _reaches_sink(
+        lines: list[str], hit: int, start: int, end: int, sink: re.Pattern
+    ) -> bool:
+        """Does the value read on line ``hit`` still appear at a sink further down the span?
+
+        The sink gate proves a sink exists in the same function, which was the whole of the
+        first bug report against this scanner: "it matched `wp_unslash()` but the `+ SQL` half
+        was never checked". This closes it -- taint the names assigned on the matched line,
+        walk forward through assignments, and require a tainted name in the sink statement.
+        46 of 77 gated findings on the fresh corpus never reached their sink; the two hand-read
+        samples were `$phone` going only to `$wpdb->update()` and a `$post_id` that the file
+        read never touched.
+
+        ponytail: within one span, forward-only, propagating through assignment. A value
+        laundered through a helper call is not followed -- same one-hop ceiling as the span
+        resolution itself. Upgrade path is a real def-use graph, which is a different tool.
+        """
+        # The match is a line, but the unit of use is the statement it sits in. Twelve of the
+        # survivors were one `'msg' => sanitize_key($_GET['msg']),` inside a multi-line array
+        # literal being handed to `wp_safe_redirect(add_query_arg(...))`: no assignment on the
+        # line, so a line-scoped trace had nothing to follow and kept every one of them.
+        first = hit
+        while first > start and not STMT_BREAK.search(lines[first - 2]):
+            first -= 1
+        last = hit
+        while last < end and ";" not in lines[last - 1]:
+            last += 1
+        stmt = "\n".join(lines[first - 1:last])
+
+        tainted = set(ASSIGN.findall(stmt))
+        if not tainted:
+            # Used inline: this statement is the whole use site, so it is a lead only if the
+            # statement is itself the sink.
+            return bool(sink.search(stmt))
+        pending = None  # name of an assignment whose statement runs past its own line
+        for n in range(last + 1, end + 1):
+            line = lines[n - 1]
+            if sink.search(line):
+                # A sink call's arguments often run onto the next lines.
+                if tainted & set(VAR_NAME.findall("\n".join(lines[n - 1:min(end, n + 2)]))):
+                    return True
+            names = ASSIGN.findall(line)
+            if names:
+                pending = names[-1]
+                if tainted & set(VAR_NAME.findall(line.split("=", 1)[1])):
+                    tainted.add(pending)
+            elif pending and tainted & set(VAR_NAME.findall(line)):
+                # `$sql = "SELECT ...` on one line, the interpolated value on the next.
+                tainted.add(pending)
+            if ";" in line:
+                pending = None
+        return False
 
     @staticmethod
     def _callback_exposure(content: str) -> dict[str, str]:
@@ -650,7 +745,9 @@ class PatchstackScanner:
                         continue
 
                     # Already escaped on this very line -- the remediation, not the bug.
-                    if _all_escaped(probes[i - 1], self.ESCAPERS.get(vuln_type, self.DEFAULT_SAFE)):
+                    if _all_escaped(probes[i - 1],
+                                    self.ESCAPERS.get(vuln_type, self.DEFAULT_SAFE),
+                                    self.SPOTS.get(vuln_type, SUPERGLOBAL)):
                         continue
 
                     span = self._enclosing_span(spans, i)
@@ -660,8 +757,14 @@ class PatchstackScanner:
                     )
 
                     sink = self.SINKS.get(vuln_type)
-                    if sink is not None and not (sink.search(scope) or self.EXEC_SINK.search(scope)):
-                        continue
+                    if sink is not None:
+                        if not (sink.search(scope) or self.EXEC_SINK.search(scope)):
+                            continue
+                        if not self._reaches_sink(
+                                lines, i,
+                                span[1] if span is not None else 1,
+                                span[2] if span is not None else len(lines), sink):
+                            continue
 
                     if vuln_type == "Broken Access Control":
                         handler = None

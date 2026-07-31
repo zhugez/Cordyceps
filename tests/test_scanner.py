@@ -278,10 +278,34 @@ def test_isset_guard_on_files_is_not_an_upload(tmp_path: Path) -> None:
         "        return;\n"
         "    }\n"
         "    $file = $_FILES['file'];\n"
+        # The scope has to write the upload, or it is not an upload vulnerability at all.
+        # `file_put_contents` and not `move_uploaded_file`, which is a rule pattern of its own
+        # and would become the one lead this function is allowed to produce.
+        "    file_put_contents( '/var/www/u.php', file_get_contents( $file['tmp_name'] ) );\n"
         "}\n"
     )
     lines = {f.line for f in _scan(tmp_path).findings if f.vuln_type == "Arbitrary File Upload"}
     assert lines == {6}, f"only the use, not the guard, is a finding: got {sorted(lines)}"
+
+
+def test_reading_an_upload_without_writing_it_is_not_an_upload_bug(tmp_path: Path) -> None:
+    """All 14 upload findings on the fresh corpus were scopes that never wrote the file."""
+    plugin = tmp_path / "csv_plugin"
+    plugin.mkdir()
+    (plugin / "csv.php").write_text(
+        "<?php\n"
+        "function cordyceps_import() {\n"
+        # A CSV importer: it reads the temp file and never puts it anywhere.
+        "    $rows = array_map( 'str_getcsv', file( $_FILES['csv']['tmp_name'] ) );\n"
+        "    return count( $rows );\n"
+        "}\n"
+        "function cordyceps_save() {\n"
+        "    $tmp = $_FILES['img']['tmp_name'];\n"
+        "    move_uploaded_file( $tmp, ABSPATH . 'wp-content/uploads/' . $_FILES['img']['name'] );\n"
+        "}\n"
+    )
+    lines = {f.line for f in _scan(tmp_path).findings if f.vuln_type == "Arbitrary File Upload"}
+    assert lines == {8}, f"only the scope that writes the upload is a lead: got {sorted(lines)}"
 
 
 def test_comment_lines_are_never_findings(tmp_path: Path) -> None:
@@ -592,3 +616,110 @@ def test_ambiguous_handler_name_does_not_suppress(tmp_path: Path) -> None:
     lines = {f.line for f in _scan(tmp_path).findings if f.vuln_type == "Broken Access Control"}
     # One `render()` guards and one does not, so the name proves nothing and the finding stands.
     assert lines == {2}, f"an ambiguous name must not suppress, got {sorted(lines)}"
+
+
+def test_closure_body_is_a_scope(tmp_path: Path) -> None:
+    """`add_action('wp_ajax_x', function(){...})` had no span, so scope fell back to the file."""
+    plugin = tmp_path / "closure_plugin"
+    plugin.mkdir()
+    (plugin / "s.php").write_text(
+        "<?php\n"
+        "add_action( 'wp_ajax_safe', function() {\n"
+        "    if ( ! current_user_can( 'manage_options' ) ) { wp_die(); }\n"
+        "    $a = wp_unslash( $_POST['a'] );\n"
+        "    $b = wp_unslash( $_POST['b'] );\n"
+        "    $wpdb->query( \"SELECT $a $b\" );\n"
+        "} );\n"
+        "function cordyceps_no_sql() {\n"
+        "    $c = wp_unslash( $_POST['c'] );\n"
+        "}\n"
+    )
+    sqli = [f for f in _scan(tmp_path).findings if f.vuln_type == "SQL Injection"]
+    # 4 and 5 are one closure, so one lead. 9 has no SQL sink in its own span -- before the
+    # closure resolved, the whole file was its scope and the query on line 6 kept it alive.
+    assert {f.line for f in sqli} == {4}, f"one closure is one scope, got {sorted(f.line for f in sqli)}"
+    # The capability check is inside the closure, so the finding must not read as unauthenticated.
+    assert "Unauthenticated" not in sqli[0].auth_required, sqli[0].auth_required
+
+
+def test_wpdb_escaping_api_is_not_a_sql_sink(tmp_path: Path) -> None:
+    """$wpdb->insert/update/delete/replace escape their own values: 24 of 80 SQLi lived on this."""
+    plugin = tmp_path / "wpdb_api_plugin"
+    plugin.mkdir()
+    (plugin / "s.php").write_text(
+        "<?php\n"
+        "function cordyceps_add_row() {\n"
+        "    global $wpdb;\n"
+        "    $label = wp_unslash( $_POST['label'] );\n"
+        "    $wpdb->insert( $wpdb->prefix . 't', array( 'label' => $label ) );\n"
+        "}\n"
+        "function cordyceps_raw_query() {\n"
+        "    global $wpdb;\n"
+        "    $wpdb->query( \"SELECT * FROM t WHERE x = \" . wp_unslash( $_POST['x'] ) );\n"
+        "}\n"
+    )
+    lines = {f.line for f in _scan(tmp_path).findings if f.vuln_type == "SQL Injection"}
+    assert lines == {9}, f"only the raw query is a sink, got {sorted(lines)}"
+
+
+def test_escaped_query_arg_is_not_xss(tmp_path: Path) -> None:
+    """add_query_arg() names no superglobal, so 28 of 28 `echo esc_url(add_query_arg())` fired."""
+    plugin = tmp_path / "qarg_plugin"
+    plugin.mkdir()
+    (plugin / "s.php").write_text(
+        "<?php\n"
+        "function cordyceps_links() {\n"
+        "    echo esc_url( add_query_arg( 'page', 2 ) );\n"
+        "}\n"
+        "function cordyceps_bare_link() {\n"
+        "    echo add_query_arg( 'page', 2 );\n"
+        "}\n"
+    )
+    lines = {f.line for f in _scan(tmp_path).findings if f.vuln_type == "Cross-Site Scripting (XSS)"}
+    assert lines == {6}, f"only the unescaped URL is XSS, got {sorted(lines)}"
+
+
+def test_value_must_reach_the_sink(tmp_path: Path) -> None:
+    """The sink gate proved a sink existed in the span, never that the value got there."""
+    plugin = tmp_path / "reach_plugin"
+    plugin.mkdir()
+    (plugin / "s.php").write_text(
+        "<?php\n"
+        "function cordyceps_unrelated() {\n"
+        "    global $wpdb;\n"
+        "    $phone = wp_unslash( $_POST['phone'] );\n"
+        "    $wpdb->update( 't', array( 'phone' => $phone ), array( 'id' => 1 ) );\n"
+        "    $wpdb->query( \"SELECT id FROM t WHERE k = 1\" );\n"
+        "}\n"
+        "function cordyceps_interpolated() {\n"
+        "    global $wpdb;\n"
+        "    $id = wp_unslash( $_POST['id'] );\n"
+        "    $sql = \"SELECT *\n"
+        "        FROM t WHERE id = $id\";\n"
+        "    $wpdb->query( $sql );\n"
+        "}\n"
+    )
+    lines = {f.line for f in _scan(tmp_path).findings if f.vuln_type == "SQL Injection"}
+    # 4 never reaches the raw query -- it only feeds $wpdb->update(), which escapes. 10 does,
+    # through a $sql whose SELECT opens on one line and interpolates $id on the next.
+    assert lines == {10}, f"only the value that reaches a sink is a lead, got {sorted(lines)}"
+
+
+def test_array_element_use_site_is_the_statement(tmp_path: Path) -> None:
+    """12 survivors were one array element inside a redirect, with no assignment on the line."""
+    plugin = tmp_path / "stmt_plugin"
+    plugin.mkdir()
+    (plugin / "s.php").write_text(
+        "<?php\n"
+        "function cordyceps_redirect_back() {\n"
+        "    global $wpdb;\n"
+        "    $wpdb->query( \"SELECT 1 FROM t\" );\n"
+        "    wp_safe_redirect( add_query_arg( array(\n"
+        "        'msg' => sanitize_key( wp_unslash( $_GET['msg'] ) ),\n"
+        "    ), admin_url() ) );\n"
+        "}\n"
+    )
+    findings = [f for f in _scan(tmp_path).findings if f.vuln_type == "SQL Injection"]
+    # The unrelated query on line 4 satisfies the span-level sink gate; the statement the
+    # value actually lives in is a redirect, so it is not a lead.
+    assert findings == [], f"a redirect argument is not a SQL lead, got {findings}"

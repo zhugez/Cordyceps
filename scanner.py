@@ -10,6 +10,7 @@ regex-driven pattern matching with sanitization-aware severity adjustment.
 from __future__ import annotations
 
 import argparse
+import bisect
 import csv
 import json
 import os
@@ -31,6 +32,9 @@ SCANNER_BANNER = f"{SCANNER_NAME} (Patchstack-based)"
 # VCS metadata, and the project's own test fixtures.
 EXCLUDE_DIRS = {
     "vendor",
+    # php-scoper output. Third-party code with a plugin-local namespace, and the only
+    # place a `create_function()` survived to the top of the report.
+    "vendor_prefixed",
     "node_modules",
     "tests",
     "test",
@@ -44,6 +48,86 @@ EXCLUDE_DIRS = {
 }
 
 SEVERITY_RANK = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1}
+
+FUNC_DECL = re.compile(r"\bfunction\s+&?\s*(\w+)\s*\(")
+
+# Line whose first non-space token opens or continues a comment. `#[` is a PHP 8 attribute.
+COMMENT_LINE = re.compile(r"\s*(//|#(?!\[)|\*|/\*)")
+
+# `isset($_GET['x'])` tests a key; it never uses the value. Patterns are matched against the
+# line with these calls blanked out, so a guard is not mistaken for a sink -- 63 of the 121
+# `echo ... $_GET` findings over 100 plugins had the superglobal nowhere else on the line.
+# Applied twice: one nesting level, e.g. `empty(helper('k', $_GET, ''))`.
+GUARD_CALL = re.compile(r"\b(?:isset|empty|array_key_exists)\s*\([^()]*\)")
+
+
+def _probe(line: str) -> str:
+    """The line as the patterns see it: key-existence checks removed, length preserved."""
+    for _ in range(2):
+        line = GUARD_CALL.sub(lambda mm: " " * len(mm.group(0)), line)
+    return line
+
+
+SUPERGLOBAL = re.compile(r"\$_(?:GET|POST|REQUEST|COOKIE|SERVER|FILES)\s*\[")
+
+# Wrappers that prove the value they enclose is not the bug the rule describes. `intval`
+# makes a value harmless everywhere; `esc_attr` only makes it harmless as output, so the
+# two sets are applied to different categories.
+NUMERIC_SAFE = frozenset({"intval", "absint", "floatval", "count", "sizeof"})
+OUTPUT_SAFE = frozenset({
+    "esc_attr", "esc_html", "esc_url", "esc_js", "esc_textarea",
+    "esc_attr_e", "esc_html_e", "wp_kses", "wp_kses_post",
+})
+# A nonce check is the defence, not the bug. The first false positive ever reported against
+# this scanner was `wp_verify_nonce(sanitize_text_field(wp_unslash($_POST[...])))` labelled
+# CRITICAL SQL Injection -- it pointed at the plugin's own protection. A value handed to
+# these is compared against a hash, never used as data, so it is safe for every category.
+NONCE_SAFE = frozenset({
+    "wp_verify_nonce", "wp_create_nonce", "check_admin_referer", "check_ajax_referer",
+})
+
+
+def _all_escaped(line: str, safe: frozenset[str]) -> bool:
+    """True when EVERY superglobal on the line sits inside a closed call to a `safe` function.
+
+    `echo esc_attr($_GET['x'])` is the fix the XSS rule recommends, not the bug it looks
+    for; 42 of 181 XSS findings over 100 plugins were already escaped that way. One bare
+    occurrence keeps the finding -- this suppresses on proof, never on a majority. A call
+    whose parenthesis does not close on this line proves nothing and is ignored.
+    """
+    spots = [m.start() for m in SUPERGLOBAL.finditer(line)]
+    if not spots:
+        return False
+    covered: set[int] = set()
+    for m in re.finditer(r"\b(\w+)\s*\(", line):
+        if m.group(1) not in safe:
+            continue
+        depth, i = 0, m.end() - 1
+        while i < len(line):
+            if line[i] == "(":
+                depth += 1
+            elif line[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        else:
+            continue
+        covered.update(s for s in spots if m.end() <= s < i)
+    return len(covered) == len(spots)
+
+# add_action('wp_ajax_nopriv_x', 'cb') / (..., array($this, 'cb')) / (..., [$this, 'cb'])
+CALLBACK_REG = re.compile(
+    r"""['"](wp_ajax_nopriv_|wp_ajax_)[^'"]*['"]\s*,\s*"""
+    # Three registration forms: a bare function name, `array($obj, 'method')`, and the
+    # WordPress Plugin Boilerplate loader's `add_action($hook, $obj, 'method')`. The third
+    # was 27 of the 71 nopriv findings whose handler name could not be read at all.
+    r"""(?:(?:array\s*\(|\[)\s*[^,]+,\s*|\$[\w>\-\[\]'"]+\s*,\s*)?['"](\w+)['"]""")
+
+# register_rest_route() spreads one route over several lines, so the handler is never on the
+# `permission_callback` line that matched. 45 of 51 name it within 8 lines of that key.
+REST_CB = re.compile(
+    r"""['"]callback['"]\s*=>\s*(?:(?:array\s*\(|\[)\s*[^,]+,\s*)?['"](\w+)['"]""")
 
 FAIL_ON_THRESHOLDS = {
     "critical": "CRITICAL",
@@ -97,8 +181,11 @@ class PatchstackScanner:
                  "$wpdb->prepare() with %1s placeholder bypasses parameterization"),
                 (r'stripslashes\s*\(\s*\$wpdb\s*->\s*prepare',
                  "stripslashes() on prepared query result removes SQL escaping"),
-                (r'\$wpdb\s*->\s*(query|get_var|get_row|get_col|get_results)\s*\(\s*["\'].*\.\s*\$(?!wpdb)',
-                 "String concatenation in SQL query - possible injection point"),
+                # Deleted: `$wpdb->query("..." . $var)`. Hand-checked twice over 100 plugins,
+                # 37/37 then 15/15 false -- always a table or column name ($table, $wpdb->prefix,
+                # $column->Field), never a request value, and it was 47% of the CRITICAL queue.
+                # ponytail: this drops laundered-request-var SQLi, which is real and common. A
+                # line-scoped regex cannot tell it from a table name; taint tracking is the fix.
             ],
         },
         "Cross-Site Scripting (XSS)": {
@@ -108,17 +195,16 @@ class PatchstackScanner:
                  "Direct echo of user input without escaping"),
                 (r'echo\s+.*\$_SERVER\s*\[\s*[\'"]PHP_SELF',
                  "$_SERVER['PHP_SELF'] reflected without escaping - XSS via URL"),
-                (r'(add_query_arg|remove_query_arg)\s*\(',
+                # Echo required on the line. Bare `add_query_arg(` is a call to a standard
+                # WP URL helper, present in most plugins: 870 hits over 100 plugins, 64% with
+                # no request source in the enclosing function. The bug shape is the *output*.
+                (r'\b(echo|print|<\?=)\b.*(add_query_arg|remove_query_arg)\s*\(',
                  "add_query_arg()/remove_query_arg() output needs esc_url()"),
-                (r'printf?\s*\(\s*[\'"]<[^>]*%s[^>]*>[\'"]',
-                 "printf/sprintf with %s inside HTML tags without escaping"),
-            ],
-        },
-        "Shortcode XSS": {
-            "severity": "HIGH",
-            "patterns": [
-                (r'add_shortcode\s*\(\s*[\'"][^\'"]+[\'"]\s*,',
-                 "Shortcode registration - verify attributes are escaped in output"),
+                # Request value required in the arguments. The bare form matched the HTML
+                # template alone -- every `printf('<a href="%s">', esc_url($x))` in WordPress:
+                # 77 hits over 100 plugins, 6 of them with any superglobal on the line.
+                (r'printf?\s*\(\s*[\'"]<[^>]*%s[^>]*>[\'"].*\$_(GET|POST|REQUEST|SERVER)',
+                 "printf/sprintf renders a request value inside an HTML tag unescaped"),
             ],
         },
         "Arbitrary File Upload": {
@@ -130,7 +216,9 @@ class PatchstackScanner:
                  "WordPress upload type check disabled (test_type => false)"),
                 (r'ZipArchive\s*::\s*extractTo|unzip_file\s*\(',
                  "ZIP extraction - check for path traversal and contained file types"),
-                (r'\$_FILES\s*\[',
+                # Not inside a conditional: `if ( ! isset( $_FILES['x'] ) )` is the guard, not
+                # the bug, and 40% of this rule's 145 hits over 100 plugins were exactly that.
+                (r'^(?!\s*(?:if|elseif|while)\b).*\$_FILES\s*\[',
                  "Direct $_FILES access - verify file type validation"),
                 (r'WP_Filesystem_Direct\s*::\s*(put_contents|move|copy)',
                  "WP_Filesystem file write - check if path is user-controlled"),
@@ -143,8 +231,10 @@ class PatchstackScanner:
                  "REST route with __return_true permission - accessible to anyone"),
                 (r'wp_ajax_nopriv_',
                  "Unauthenticated AJAX handler - verify it should be public"),
-                (r'wp_localize_script\s*\([^)]*nonce[^)]*wp_create_nonce',
-                 "Nonce exposed to frontend via wp_localize_script - check if combined with capability check"),
+                # Deleted: `wp_localize_script(... 'nonce' => wp_create_nonce(...))`. That is the
+                # documented way to hand a nonce to JS -- the defence every AJAX plugin is supposed
+                # to ship, not a bug. 52 raw hits over 18 of 100 plugins, and its own text said
+                # "check if combined with capability check", which is a hedge, not a finding.
             ],
         },
         "PHP Object Injection": {
@@ -180,8 +270,10 @@ class PatchstackScanner:
             "patterns": [
                 (r'(include|require)(_once)?\s*\(\s*.*\$_(GET|POST|REQUEST)',
                  "File inclusion with user-controlled path"),
-                (r'(include|require)(_once)?\s+\$(?!this)',
-                 "Dynamic file inclusion with variable path - check source"),
+                # Deleted: `(include|require)(_once)?\s+\$(?!this)`. Its own description was
+                # "check source" and nothing ever did: 324 hits over 100 plugins, 92% with no
+                # request source in the enclosing function, every PSR autoloader among them.
+                # All 3 CVSS-9.8 findings in that run were false and 2 came from this rule.
             ],
         },
         "Server-Side Request Forgery (SSRF)": {
@@ -191,8 +283,9 @@ class PatchstackScanner:
                  "WordPress HTTP request with user-controlled URL"),
                 (r'file_get_contents\s*\(\s*.*\$_(GET|POST|REQUEST)',
                  "file_get_contents() with user-controlled URL"),
-                (r'curl_exec\s*\(',
-                 "cURL execution - verify URL is not user-controlled"),
+                # Deleted: `curl_exec\s*\(`. Its description was "verify URL is not
+                # user-controlled" and nothing verified: 43 hits over 100 plugins, 86% with no
+                # request source in the enclosing function. Matching cURL is not a finding.
             ],
         },
         "Privilege Escalation": {
@@ -221,6 +314,13 @@ class PatchstackScanner:
                  "readfile() with user-controlled path"),
                 (r'(highlight_file|show_source)\s*\(\s*\$_(GET|POST|REQUEST)',
                  "Source file disclosure with user-controlled path"),
+                # The three rules above demand the superglobal syntactically inside the sink
+                # call. Real code launders it first, so across 26 plugins that a cross-function
+                # hunt flagged for file read they matched 0 lines against 557 sink lines.
+                # This is SQL Injection's shape: match the source, let SINKS prove the sink is
+                # in the same function. 13 findings on those 26 plugins.
+                (r'wp_unslash\s*\(\s*\$_(GET|POST|REQUEST|COOKIE)',
+                 "Request value unslashed in a function that reads a file by path"),
             ],
         },
         "Arbitrary File Deletion": {
@@ -230,6 +330,11 @@ class PatchstackScanner:
                  "File deletion with user-controlled path"),
                 (r'wp_delete_file\s*\(\s*.*\$_(GET|POST|REQUEST)',
                  "WordPress file deletion with user-controlled path"),
+                # Same recall hole as Arbitrary File Read: 0 raw matches against 305 sink lines
+                # over the 23 plugins the file-deletion hunt flagged. 28 findings with the
+                # source-plus-sink shape.
+                (r'wp_unslash\s*\(\s*\$_(GET|POST|REQUEST|COOKIE)',
+                 "Request value unslashed in a function that deletes a file"),
             ],
         },
         "Open Redirect": {
@@ -241,33 +346,91 @@ class PatchstackScanner:
                  "Header redirect with user-controlled URL"),
             ],
         },
-        "CSRF": {
-            "severity": "MEDIUM",
-            "patterns": [
-                (r'add_action\s*\(\s*[\'"]admin_init[\'"].*update_option',
-                 "admin_init with update_option - check for nonce verification"),
-                (r'add_action\s*\(\s*[\'"]init[\'"].*(?:update_option|wp_delete|wp_insert|wp_update)',
-                 "init hook with state change - verify nonce and capability checks"),
-            ],
-        },
         "Type Juggling": {
             "severity": "MEDIUM",
             "patterns": [
-                (r'==\s*\$_(GET|POST|REQUEST)',
+                # `(?<![=!<>])==(?!=)`: the bare `==` matched the tail of `===`, so the rule
+                # fired on the strict comparison it exists to recommend. All 157 hits over 100
+                # plugins were `'x' === $_GET['action']` or `!==`. Loose `==` only.
+                (r'(?<![=!<>])==(?!=)\s*\$_(GET|POST|REQUEST)',
                  "Loose comparison with user input - use === instead"),
             ],
         },
     }
 
+    # Curated literal list, deliberately NOT a `esc_|sanitize_` prefix rule: esc_sql(),
+    # esc_url_raw(), sanitize_sql_orderby() and $wpdb->esc_like() all match such a prefix
+    # and none of them make a value safe. Measured: the prefix version wrongly downgrades
+    # 10 real findings (9 CRITICAL SQLi, 1 HIGH XSS) on the corpus.
     SAFE_FUNCS = (
-        "esc_html", "esc_attr", "esc_url", "esc_js",
+        "esc_html", "esc_attr", "esc_url", "esc_js", "esc_textarea",
         "wp_kses", "wp_kses_post",
         "sanitize_text_field", "sanitize_email", "sanitize_file_name",
+        "sanitize_key", "sanitize_title", "sanitize_title_with_dashes",
+        "sanitize_textarea_field", "sanitize_html_class", "sanitize_hex_color",
+        "sanitize_url", "sanitize_user",
+        "wc_clean", "wc_sanitize_taxonomy_name",
+        "wp_check_filetype", "wp_check_filetype_and_ext", "wp_handle_upload",
+        "wp_handle_sideload", "media_handle_upload", "wp_unique_filename",
         "intval", "absint", "floatval",
         "wp_verify_nonce", "check_admin_referer", "check_ajax_referer",
         "current_user_can",
         "wpdb->prepare",
     )
+
+    # Sink evidence required before a finding in these categories is emitted. A category
+    # absent from this table is never gated: for Broken Access Control the real sink lives
+    # in a separately-named callback body, not on the registration line that matched, so
+    # gating it suppresses 99% of the scanner's best class.
+    #
+    # A gate only adds information when the rule's own pattern does not already contain the
+    # sink. LFI is the counter-example and has no entry here: the rule matches `include`, the
+    # sink regex would be `include`, and the enclosing span always contains the matched line —
+    # provably a no-op. Measured 541 -> 540 over 222 plugins before the entry was removed.
+    SINKS = {
+        "SQL Injection": re.compile(
+            r"\$wpdb\b|->\s*(query|get_var|get_row|get_col|get_results|prepare)\s*\("
+            r"|\bmysqli?_query\s*\("
+            # Statement-shaped, not bare keywords: `\bSELECT\b` alone also matches the
+            # HTML tag `<select>`, which kept 632/1426 findings alive on nothing.
+            r"|\bSELECT\b[\s\S]{0,200}?\bFROM\b|\bUPDATE\b[\s\S]{0,200}?\bSET\b"
+            r"|\bINSERT\s+INTO\b|\bDELETE\s+FROM\b|\bREPLACE\s+INTO\b|\bTRUNCATE\s+TABLE\b",
+            re.IGNORECASE),
+        "Server-Side Request Forgery (SSRF)": re.compile(
+            r"\bwp_remote_\w+\s*\(|\bcurl_(exec|init|setopt)\s*\("
+            r"|\b(file_get_contents|fsockopen|fopen)\s*\("),
+        "PHP Object Injection": re.compile(r"\b(maybe_)?unserialize\s*\("),
+        "Arbitrary File Read": re.compile(
+            r"\b(file_get_contents|readfile|fread|fgets|fgetcsv|highlight_file|show_source|file)\s*\("
+            r"|\bSplFileObject\b"),
+        "Arbitrary File Deletion": re.compile(r"\b(unlink|wp_delete_file|rmdir)\s*\("),
+        "Open Redirect": re.compile(
+            r"\bwp_(safe_)?redirect\s*\(|\bheader\s*\(\s*['\"]\s*Location\s*:"),
+        "Privilege Escalation": re.compile(
+            r"\b(update_option|add_option|update_site_option|update_user_meta|add_user_meta"
+            r"|wp_insert_user|wp_create_user|wp_update_user|wp_set_password"
+            r"|wp_set_auth_cookie|wp_set_current_user)\s*\("
+            r"|->\s*(set_role|add_role|add_cap)\s*\("),
+    }
+
+    # Output escapers only prove safety for the category whose sink is output. Every other
+    # rule keeps its finding unless the value was cast to a number.
+    DEFAULT_SAFE = NUMERIC_SAFE | NONCE_SAFE
+    ESCAPERS = {"Cross-Site Scripting (XSS)": DEFAULT_SAFE | OUTPUT_SAFE}
+
+    # A nopriv registration is a finding only when the handler it names checks nothing.
+    # Measured over 100 plugins: 235 registrations, and 77% of the ones whose callback body
+    # resolves guard inside that body. Unresolved callback -> emit, same as every other
+    # fallback here: this can suppress only on positive evidence of a guard.
+    GUARDS = re.compile(
+        r"\b(current_user_can|current_user_can_for_blog|user_can|is_user_logged_in"
+        r"|check_ajax_referer|check_admin_referer|wp_verify_nonce|wp_die)\s*\(")
+
+    # A body that executes code is never suppressed, whatever the category. Unioned into
+    # every gated check so a deprecated eval-equivalent cannot cause a false suppression;
+    # this can only emit more, never suppress more.
+    EXEC_SINK = re.compile(
+        r"\b(eval|assert|create_function|system|exec|shell_exec|passthru|popen|proc_open)\s*\(")
 
     CAP_MAP = {
         "manage_options": "Admin",
@@ -296,6 +459,14 @@ class PatchstackScanner:
         self.report_file = report_file
         self.quiet = quiet
         self.findings: list[Finding] = []
+        # (plugin, handler) already reported once. Keyed by plugin so two plugins that
+        # happen to share a handler name still get one finding each.
+        self._seen_handlers: set[tuple[str, str]] = set()
+        # (plugin, file, function start line, category) already reported once.
+        self._seen_scopes: set[tuple[str, str, int, str]] = set()
+        # Functions in the plugin being scanned whose body performs a capability check.
+        # Rebuilt per plugin by scan_plugin(); empty when scan_file() is called directly.
+        self._guarded: set[str] = set()
         self.stats: dict[str, int] = defaultdict(int)
 
     def _log(self, msg: str) -> None:
@@ -312,11 +483,116 @@ class PatchstackScanner:
             out.append(f"{prefix} {i + 1:4d} | {lines[i].rstrip()}")
         return "\n".join(out)
 
-    def _nearby_sanitization(self, lines: list[str], line_num: int, window: int = 20) -> list[str]:
-        start = max(0, line_num - window - 1)
-        end = min(len(lines), line_num + window)
+    # ponytail: one-hop function-span resolution, same ceiling as scripts/bac_scan.py.
+    # Two-hop (handler -> helper -> sink) is a known miss; see hd-quiz-save-results-light.
+    # Upgrade path is bac_scan's callback resolver, not a taint engine.
+    # Brace matching is quote- and comment-aware but not heredoc-aware: a `{` inside a
+    # <<<HEREDOC mis-spans that one function. Every consumer falls back to whole-file when a
+    # span does not resolve, so the worst case is today's behaviour, never silence.
+    @staticmethod
+    def _match_body(text: str, pos: int) -> tuple[int, int] | None:
+        """From just after `function name(`, return the {...} body offsets, or None."""
+        depth = 0
+        quote = None
+        comment = None  # "//" for line comments, "/*" for block comments
+        escaped = False
+        body_start = -1
+        for i in range(pos, len(text)):
+            char = text[i]
+            if comment:
+                if comment == "//":
+                    if char == "\n":
+                        comment = None
+                elif char == "/" and text[i - 1] == "*":
+                    comment = None
+                continue
+            if quote:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == quote:
+                    quote = None
+                continue
+            # Comments before quotes: an apostrophe in `// don't` opened a string that never
+            # closed, swallowing the rest of a 7,603-line file and losing 5 of its 136 bodies.
+            if char == "#" or (char == "/" and text[i + 1:i + 2] == "/"):
+                comment = "//"
+            elif char == "/" and text[i + 1:i + 2] == "*":
+                comment = "/*"
+            elif char in ("'", '"'):
+                quote = char
+            elif char == "{":
+                if body_start < 0:
+                    body_start = i
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    return body_start, i
+            elif char == ";" and body_start < 0:
+                return None  # abstract / interface declaration, no body
+        return None
+
+    @classmethod
+    def _function_spans(cls, text: str) -> list[tuple[str, int, int]]:
+        """[(name, start_line, end_line)] for every function body in the file."""
+        line_starts = [0]
+        line_starts.extend(i + 1 for i, char in enumerate(text) if char == "\n")
+        spans = []
+        for match in FUNC_DECL.finditer(text):
+            body = cls._match_body(text, match.end())
+            if body is None:
+                continue
+            spans.append((
+                match.group(1),
+                bisect.bisect_right(line_starts, body[0]),
+                bisect.bisect_right(line_starts, body[1]),
+            ))
+        return spans
+
+    @staticmethod
+    def _enclosing_span(
+        spans: list[tuple[str, int, int]], line: int
+    ) -> tuple[str, int, int] | None:
+        """Innermost span containing ``line``, or None when the line is at top level."""
+        best = None
+        for span in spans:
+            if span[1] <= line <= span[2] and (best is None or span[1] > best[1]):
+                best = span
+        return best
+
+    @staticmethod
+    def _callback_exposure(content: str) -> dict[str, str]:
+        """Handler function name -> exposure label, taken from its registration site."""
+        out: dict[str, str] = {}
+        for hook, callback in CALLBACK_REG.findall(content):
+            label = (
+                "Unauthenticated" if hook == "wp_ajax_nopriv_"
+                else "Authenticated (Subscriber+)"
+            )
+            if label == "Unauthenticated" or callback not in out:
+                out[callback] = label
+        return out
+
+    def _nearby_sanitization(
+        self,
+        lines: list[str],
+        line_num: int,
+        window: int = 20,
+        span: tuple[str, int, int] | None = None,
+    ) -> list[str]:
+        if span is not None:
+            start, end = span[1] - 1, span[2]
+        else:
+            start = max(0, line_num - window - 1)
+            end = min(len(lines), line_num + window)
         chunk = "\n".join(lines[start:end])
-        return [func for func in self.SAFE_FUNCS if func in chunk]
+        # Word-boundary, not substring: `my_intval_helper` is not a call to intval().
+        return [
+            func for func in self.SAFE_FUNCS
+            if re.search(rf"\b{re.escape(func)}\b", chunk)
+        ]
 
     def _file_auth_context(self, content: str) -> str:
         """Determine the dominant auth context for a file (computed once per file)."""
@@ -343,7 +619,16 @@ class PatchstackScanner:
             return
 
         lines = content.split("\n")
-        auth = self._file_auth_context(content)
+        # Only rebuild lines that actually hold a guard call -- a substring test is ~13%
+        # of the scan's wall clock cheaper than running the regex over every line.
+        probes = [
+            _probe(line) if ("isset" in line or "empty" in line or "array_key_exists" in line)
+            else line
+            for line in lines
+        ]
+        file_auth = self._file_auth_context(content)
+        spans = self._function_spans(content)
+        exposure = self._callback_exposure(content)
 
         try:
             rel_path = str(filepath.relative_to(self.extract_dir))
@@ -355,10 +640,84 @@ class PatchstackScanner:
             for pattern, description in config["patterns"]:
                 compiled = re.compile(pattern, re.IGNORECASE)
                 for i, line in enumerate(lines, 1):
-                    if not compiled.search(line):
+                    if not compiled.search(probes[i - 1]):
                         continue
 
-                    nearby_safe = self._nearby_sanitization(lines, i)
+                    # A match inside a comment is never a vulnerability. 10/844 findings over
+                    # 100 plugins sat on one, including a `@see \ZipArchive::extractTo()` docblock
+                    # reported CRITICAL.
+                    if COMMENT_LINE.match(line):
+                        continue
+
+                    # Already escaped on this very line -- the remediation, not the bug.
+                    if _all_escaped(probes[i - 1], self.ESCAPERS.get(vuln_type, self.DEFAULT_SAFE)):
+                        continue
+
+                    span = self._enclosing_span(spans, i)
+                    scope = (
+                        "\n".join(lines[span[1] - 1:span[2]]) if span is not None
+                        else content
+                    )
+
+                    sink = self.SINKS.get(vuln_type)
+                    if sink is not None and not (sink.search(scope) or self.EXEC_SINK.search(scope)):
+                        continue
+
+                    if vuln_type == "Broken Access Control":
+                        handler = None
+                        if "wp_ajax_nopriv_" in line:
+                            cb = CALLBACK_REG.search(line)
+                            handler = cb.group(2) if cb else None
+                        elif "permission_callback" in line:
+                            # Nearest wins: one function usually registers several routes,
+                            # so the first `callback` key in the window is often the
+                            # previous route's. 45 of 51 sit within 8 lines of their key.
+                            near = sorted(
+                                (j for j in range(max(1, i - 8), min(len(lines), i + 8) + 1)
+                                 if REST_CB.search(lines[j - 1])),
+                                key=lambda j: abs(j - i))
+                            handler = REST_CB.search(lines[near[0] - 1]).group(1) if near else None
+
+                        if handler is not None:
+                            # Same file first, then the plugin-wide index. Absence from both is
+                            # not evidence -- an unresolvable handler still emits.
+                            body = next((s for s in spans if s[0] == handler), None)
+                            if body and self.GUARDS.search(
+                                    "\n".join(lines[body[1] - 1:body[2]])):
+                                continue
+                            if handler in self._guarded:
+                                continue
+
+                            # One handler bound to 52 hook names is one lead, not 52.
+                            # echo-knowledge-base alone was 52 of the 206 findings here.
+                            if (plugin_name, handler) in self._seen_handlers:
+                                continue
+                            self._seen_handlers.add((plugin_name, handler))
+
+                    # One vulnerable function is one lead. houzez-property-feed's
+                    # save_import_settings reads 37 request fields into one query builder and
+                    # produced 37 SQL Injection findings; a triager opens that function once.
+                    # 214 of 466 findings over 100 plugins were repeats of this shape.
+                    # Broken Access Control is excluded: it already dedups by handler name, and
+                    # one registration function legitimately binds many distinct handlers.
+                    if vuln_type != "Broken Access Control":
+                        # Start line, not name -- two classes in one file may share a method name.
+                        scope_key = (plugin_name, rel_path,
+                                     span[1] if span is not None else -i, vuln_type)
+                        if scope_key in self._seen_scopes:
+                            continue
+                        self._seen_scopes.add(scope_key)
+
+                    # Broken Access Control matches the registration statement itself, so
+                    # file scope is already the right scope for it.
+                    if span is None or vuln_type == "Broken Access Control":
+                        auth = file_auth
+                    elif span[0] in exposure:
+                        auth = exposure[span[0]]
+                    else:
+                        auth = self._file_auth_context(scope)
+
+                    nearby_safe = self._nearby_sanitization(lines, i, span=span)
                     if nearby_safe:
                         adjusted_severity = self.SEVERITY_DOWNGRADE.get(severity, severity)
                         analysis = (
@@ -400,8 +759,40 @@ class PatchstackScanner:
                 if name.endswith(".php"):
                     yield Path(dirpath) / name
 
+    def _guarded_functions(self, plugin_dir: Path) -> set[str]:
+        """Names of functions anywhere in the plugin whose body performs a capability check.
+
+        The WordPress Plugin Boilerplate registers hooks in `includes/class-*.php` and defines the
+        handlers in `public/class-*-public.php`, so a same-file lookup resolves none of them: of the
+        27 nopriv findings whose handler is named in the `$obj, 'method'` loader form, **0** resolve
+        in the matched file and **26** guard when the whole plugin is searched. Only names are kept,
+        not bodies -- a set of strings per plugin rather than its source.
+        """
+        guarded: set[str] = set()
+        unguarded: set[str] = set()
+        for php_file in self._iter_php_files(plugin_dir):
+            try:
+                text = php_file.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+            # Cheap reject: no capability check anywhere in the file, so no body in it guards.
+            # Names are enough here, and reading them off the declarations skips the brace
+            # matching that dominates this pass -- most files in a plugin take this branch.
+            if not self.GUARDS.search(text):
+                unguarded.update(FUNC_DECL.findall(text))
+                continue
+            lines = text.split("\n")
+            for name, start, end in self._function_spans(text):
+                bucket = (guarded if self.GUARDS.search("\n".join(lines[start - 1:end]))
+                          else unguarded)
+                bucket.add(name)
+        # The index is keyed by name, not by class, so a name defined twice proves nothing unless
+        # every definition guards -- 141 of 4,348 duplicated names over 100 plugins disagree.
+        return guarded - unguarded
+
     def scan_plugin(self, plugin_dir: Path) -> None:
         plugin_name = plugin_dir.name
+        self._guarded = self._guarded_functions(plugin_dir)
         for php_file in self._iter_php_files(plugin_dir):
             self.scan_file(php_file, plugin_name)
 

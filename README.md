@@ -1,7 +1,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/version-1.1.0-brightgreen?style=for-the-badge" alt="Version"/>
   <img src="https://img.shields.io/badge/platform-linux%20%7C%20windows%20%7C%20macos-blue?style=for-the-badge" alt="Platform"/>
-  <img src="https://img.shields.io/badge/license-MIT-orange?style=for-the-badge" alt="License"/>
+  <img src="https://img.shields.io/badge/license-GPL--3.0-orange?style=for-the-badge" alt="License"/>
   <img src="https://img.shields.io/badge/runtime-OpenClaw%20%7C%20Hermes-purple?style=for-the-badge" alt="Runtimes"/>
   <img src="https://img.shields.io/badge/spec-agentskills.io-lightgrey?style=for-the-badge" alt="agentskills.io"/>
 </p>
@@ -313,7 +313,7 @@ installations. The authors are not responsible for any misuse.
 
 ## License
 
-MIT License - See [LICENSE](LICENSE) for details.
+GPL-3.0 - See [LICENSE](LICENSE) for details.
 
 ---
 
